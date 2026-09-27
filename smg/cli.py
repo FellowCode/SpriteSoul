@@ -125,7 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Установить CUDA-сборку PyTorch и заранее скачать модели.",
         epilog="Пример: sprite-soul setup --models depth --progress json",
     )
-    setup.add_argument("--models", choices=("all", "depth", "ai", "none"), default="all",
+    setup.add_argument("--models", choices=("all", "depth", "ai", "sam", "none"), default="all",
                        help="какие модели скачать (по умолчанию: all)")
     setup.add_argument("--skip-cuda", action="store_true",
                        help="скачать модели без проверки и установки CUDA")
@@ -136,7 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _setup_command(args: argparse.Namespace, reporter: Reporter) -> int:
     from smg.setup import prepare_environment
 
-    models = ("depth", "ai") if args.models == "all" else (() if args.models == "none" else (args.models,))
+    models = ("depth", "ai", "sam") if args.models == "all" else (() if args.models == "none" else (args.models,))
     try:
         prepare_environment(models, reporter.text, install_cuda=not args.skip_cuda,
                             events=reporter.emit)
@@ -164,12 +164,13 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
     from smg.setup import prepare_environment
 
     if path.suffix.lower() == ".ssoul":
-        source_path, base_depth, _, _ = load_project(path)
+        source_path, base_depth, _, _, foliage_mask = load_project(path, with_foliage_mask=True)
         rgba = open_png(source_path)
     else:
         source_path = path
         rgba = open_png(path)
         base_depth = open_depth_png(args.depth_map, rgba.shape[:2]) if args.depth_map else None
+        foliage_mask = None
 
     output = args.output
     stem = source_path.stem
@@ -239,7 +240,8 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
     if args.save_project:
         output.mkdir(parents=True, exist_ok=True)
         save_project(output / f"{stem}.ssoul", source_path, depth,
-                     20.0, "OpenGL" if args.convention == "opengl" else "DirectX")
+                     20.0, "OpenGL" if args.convention == "opengl" else "DirectX",
+                     foliage_mask=foliage_mask)
     return paths
 
 

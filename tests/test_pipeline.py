@@ -46,3 +46,25 @@ def test_normalized_depth_is_float32():
     raw = np.arange(25, dtype=np.float32).reshape(5, 5)
     alpha = np.full((5, 5), 255, np.uint8)
     assert normalize_depth(raw, alpha).dtype == np.float32
+
+
+def test_project_persists_optional_foliage_mask_and_supports_mask_only(tmp_path):
+    source = np.zeros((9, 13, 4), np.uint8)
+    source[..., 3] = 255
+    path = tmp_path / "tree.png"
+    Image.fromarray(source).save(path)
+    mask = np.zeros((9, 13), bool)
+    mask[2:7, 4:11] = True
+    project = tmp_path / "tree.ssoul"
+    save_project(project, path, None, 20.0, "OpenGL", foliage_mask=mask)
+
+    # Existing callers retain their original four-item API.
+    loaded_path, depth, strength, convention = load_project(project)
+    assert loaded_path == path and depth is None
+    assert strength == 20.0 and convention == "OpenGL"
+    loaded_path, depth, strength, convention, restored = load_project(
+        project, with_foliage_mask=True
+    )
+    assert loaded_path == path and depth is None
+    assert strength == 20.0 and convention == "OpenGL"
+    assert restored.dtype == bool and np.array_equal(restored, mask)

@@ -37,6 +37,14 @@ def test_setup_prepares_albedo_on_demand(monkeypatch):
     assert calls == ["albedo"]
 
 
+def test_setup_prepares_sam_on_demand_and_uses_cuda(monkeypatch):
+    calls = []
+    monkeypatch.setattr(setup, "ensure_cuda", lambda progress, events=None: calls.append("cuda"))
+    monkeypatch.setattr(setup, "_prepare_sam", lambda progress, events: calls.append("sam"))
+    setup.prepare_environment(("sam",))
+    assert calls == ["cuda", "sam"]
+
+
 def test_setup_installs_cuda_wheel_only_when_needed(monkeypatch):
     statuses = iter([{"error": "No module named torch"},
                      {"version": "2.6.0+cu126", "cuda": "12.6", "available": True}])
@@ -65,6 +73,14 @@ def test_setup_cli_dispatch(monkeypatch):
                         calls.append((models, install_cuda)))
     assert main(["setup", "--models", "ai", "--skip-cuda"]) == 0
     assert calls == [(("ai",), False)]
+
+
+def test_setup_cli_accepts_sam(monkeypatch):
+    calls = []
+    monkeypatch.setattr(setup, "prepare_environment", lambda models, progress, install_cuda, events=None:
+                        calls.append((models, install_cuda)))
+    assert main(["setup", "--models", "sam", "--skip-cuda"]) == 0
+    assert calls == [(("sam",), False)]
 
 
 def test_cuda_installed_but_unavailable_reports_driver_issue(monkeypatch):

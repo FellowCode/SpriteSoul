@@ -5,7 +5,7 @@ import pytest
 from PIL import Image
 
 from smg.cli import main
-from smg.export import load_project
+from smg.export import load_project, save_project
 from smg.pipeline import open_png
 
 
@@ -136,6 +136,24 @@ def test_cli_rejects_removed_hybrid_source(tmp_path):
     with pytest.raises(SystemExit) as exc:
         main([str(source), "--maps", "normal", "--normal-source", "hybrid"])
     assert exc.value.code == 2
+
+
+def test_cli_round_trip_preserves_project_foliage_mask(tmp_path):
+    source = tmp_path / "foliage.png"
+    rgba = _source(source)
+    depth = np.full(rgba.shape[:2], 0.6, np.float32)
+    mask = np.zeros(rgba.shape[:2], bool)
+    mask[2:6, 3:9] = True
+    project = tmp_path / "foliage.ssoul"
+    save_project(project, source, depth, 20.0, "OpenGL", foliage_mask=mask)
+    output = tmp_path / "out"
+
+    assert main([str(project), "-o", str(output), "--maps", "depth", "--save-project"]) == 0
+    _source_path, saved_depth, _strength, _convention, restored = load_project(
+        output / "foliage.ssoul", with_foliage_mask=True
+    )
+    assert np.array_equal(saved_depth, depth)
+    assert np.array_equal(restored, mask)
 
 
 def test_cli_json_result_and_error_stream(tmp_path, capsys):

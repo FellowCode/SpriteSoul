@@ -1,11 +1,12 @@
 from pathlib import Path
+from queue import Queue
 
 import numpy as np
 from PySide6.QtCore import QSettings, QThread, Signal, Qt
-from PySide6.QtGui import QAction, QIcon, QKeySequence
+from PySide6.QtGui import QAction, QGuiApplication, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame,
-    QHBoxLayout, QLabel, QMainWindow, QMessageBox, QProgressBar, QSlider,
+    QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QProgressBar, QSlider,
     QSpinBox, QStatusBar, QToolBar, QVBoxLayout, QWidget,
 )
 
@@ -17,6 +18,7 @@ from smg.export import export_albedo, export_depth, export_normal, load_project,
 from smg.normal import ai_normal, orient_ai_vectors, postprocess_ai_vectors
 from smg.normal_ai import DSINENormalModel
 from smg.pipeline import generate_depth, open_png
+from smg.segmentation import SamSession
 from smg.setup import MODEL_LABELS, missing_models, prepare_environment
 from smg.ui.image_view import ImageView
 from smg.ui.lighting_preview import render_lighting
@@ -70,11 +72,54 @@ class SetupThread(QThread):
     def run(self) -> None:
         try:
             prepare_environment(
-                ("depth", "ai"), self.progress.emit, events=self.progress_event.emit
+                ("depth", "ai", "sam"), self.progress.emit, events=self.progress_event.emit
             )
             self.prepared.emit()
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class SamSelectionThread(QThread):
+    """Keep SAM on a worker thread while the user refines one mask."""
+
+    ready = Signal()
+    mask_generated = Signal(object)
+    mask_failed = Signal(str)
+    failed = Signal(str)
+    progress = Signal(str)
+    progress_event = Signal(object)
+
+    def __init__(self, rgba: np.ndarray, parent=None):
+        super().__init__(parent)
+        self.rgba = rgba.copy()
+        self.requests: Queue = Queue()
+
+    def predict(self, points: list[tuple[int, int]], labels: list[int]) -> None:
+        self.requests.put(("predict", points.copy(), labels.copy()))
+
+    def stop(self) -> None:
+        self.requests.put(("stop",))
+
+    def run(self) -> None:
+        session = None
+        try:
+            prepare_environment(("sam",), self.progress.emit, events=self.progress_event.emit)
+            session = SamSession(self.rgba)
+            session.open(self.progress.emit)
+            self.ready.emit()
+            while True:
+                request = self.requests.get()
+                if request[0] == "stop":
+                    break
+                try:
+                    self.mask_generated.emit(session.predict(request[1], request[2]))
+                except Exception as exc:
+                    self.mask_failed.emit(str(exc))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if session is not None:
+                session.close()
 
 
 class GenerateAlbedoThread(QThread):
@@ -150,10 +195,20 @@ class MainWindow(QMainWindow):
         self.ai_vectors: np.ndarray | None = None  # OpenGL float XYZ, converted at inference time
         self.albedo: np.ndarray | None = None
         self.worker: QThread | None = None
+        self.foliage_mask: np.ndarray | None = None
+        self._selection_mask: np.ndarray | None = None
+        self._selection_points: list[tuple[int, int]] = []
+        self._selection_labels: list[int] = []
+        self._selection_active = False
+        self._selection_ready = False
+        self._selection_pending = False
         self.light = (0.35, 0.45)
         self._building = True
         self._build_ui()
         self._building = False
+        self._theme_hints = QGuiApplication.styleHints()
+        self._theme_hints.colorSchemeChanged.connect(self._apply_system_theme)
+        self._apply_system_theme(self._theme_hints.colorScheme())
         self._update_actions()
         self.setStatusBar(QStatusBar())
         self.download_progress = QProgressBar(self)
@@ -179,6 +234,9 @@ class MainWindow(QMainWindow):
         self.generate_all_action = self._action(
             "Все карты", "Ctrl+Alt+G", self.generate_all
         )
+        self.select_foliage_action = self._action(
+            "Выделить листву", "Ctrl+Shift+L", self.start_foliage_selection
+        )
         # Compatibility aliases for code that used the previous action names.
         self.generate_action = self.generate_depth_action
         self.generate_ai_action = self.generate_normal_action
@@ -193,7 +251,7 @@ class MainWindow(QMainWindow):
         self.export_action = self._action("Экспорт", "Ctrl+E", self.export)
         for action in (
             self.open_action, self.setup_action, self.generate_menu.menuAction(),
-            self.undo_action, self.redo_action, self.export_action,
+            self.select_foliage_action, self.undo_action, self.redo_action, self.export_action,
         ):
             toolbar.addAction(action)
         toolbar.addSeparator()
@@ -208,6 +266,7 @@ class MainWindow(QMainWindow):
         self.view = ImageView()
         self.view.brush_event.connect(self._brush_event)
         self.view.light_changed.connect(self._light_changed)
+        self.view.selection_event.connect(self._selection_click)
         row.addWidget(self.view, 1)
 
         panel = QFrame()
@@ -220,7 +279,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(QLabel("Просмотр"))
         self.mode = QComboBox()
-        self.mode.addItems(("Source", "Albedo", "Depth", "Normal", "Lighting Preview"))
+        self.mode.addItems(("Source", "Albedo", "Depth", "Normal", "Lighting Preview", "Foliage Mask"))
         self.mode.currentTextChanged.connect(self._mode_changed)
         layout.addWidget(self.mode)
 
@@ -274,6 +333,22 @@ class MainWindow(QMainWindow):
         self.invert_ai_y.toggled.connect(self._normal_changed)
         normal_form.addRow(self.invert_ai_y)
 
+        layout.addWidget(QLabel("Листва (SAM 2.1)"))
+        selection_form = QFormLayout()
+        layout.addLayout(selection_form)
+        self.selection_kind = QComboBox()
+        self.selection_kind.addItems(("Добавить", "Исключить"))
+        selection_form.addRow("Клик", self.selection_kind)
+        self.selection_done = QPushButton("Готово")
+        self.selection_done.clicked.connect(self.finish_foliage_selection)
+        self.selection_clear = QPushButton("Очистить")
+        self.selection_clear.clicked.connect(self.clear_foliage_selection)
+        self.selection_cancel = QPushButton("Отмена")
+        self.selection_cancel.clicked.connect(self.cancel_foliage_selection)
+        selection_form.addRow(self.selection_done)
+        selection_form.addRow(self.selection_clear)
+        selection_form.addRow(self.selection_cancel)
+
         layout.addWidget(QLabel("Кисть"))
         self.tool = QComboBox()
         self.tool.addItems(("Pan", "Raise", "Lower", "Smooth"))
@@ -289,32 +364,51 @@ class MainWindow(QMainWindow):
         brush_form.addRow("Strength", self.brush_strength)
         layout.addStretch()
         self.hint = QLabel("В режиме Lighting Preview тяните мышью по изображению, чтобы переместить свет.")
+        self.hint.setObjectName("hint")
         self.hint.setWordWrap(True)
-        self.hint.setStyleSheet("color: #6b7280")
         layout.addWidget(self.hint)
+
+    def _apply_system_theme(self, scheme=None) -> None:
+        """Keep custom controls in step with Qt's system colour-scheme support."""
+        if scheme is None:
+            scheme = QGuiApplication.styleHints().colorScheme()
+        dark = scheme == Qt.ColorScheme.Dark
+        if dark:
+            colors = {
+                "panel": "#20252e", "panel_border": "#3a4352", "text": "#e7edf5",
+                "muted": "#aeb9c8", "field": "#2b313c", "field_border": "#59687b",
+                "hover": "#8ea2b8", "focus": "#5aa9e6", "drop_down": "#3b4656",
+            }
+        else:
+            colors = {
+                "panel": "#f5f6f8", "panel_border": "#d7dbe1", "text": "#252b34",
+                "muted": "#6b7280", "field": "#ffffff", "field_border": "#aeb7c2",
+                "hover": "#66788b", "focus": "#3074a8", "drop_down": "#354454",
+            }
         arrow_icon = (Path(__file__).resolve().parent / "icons" / "chevron-down.svg").as_posix()
         styles = """
-            QFrame#controls { background: #f5f6f8; border-left: 1px solid #d7dbe1; }
-            QLabel, QFrame#controls QCheckBox { color: #252b34; }
+            QFrame#controls { background: %(panel)s; border-left: 1px solid %(panel_border)s; }
+            QFrame#controls QLabel, QFrame#controls QCheckBox { color: %(text)s; }
+            QFrame#controls QLabel#hint { color: %(muted)s; }
             QSlider { min-height: 22px; }
             QFrame#controls QComboBox, QFrame#controls QSpinBox, QFrame#controls QDoubleSpinBox {
-                color: #252b34;
-                background: #ffffff;
-                border: 1px solid #aeb7c2;
+                color: %(text)s;
+                background: %(field)s;
+                border: 1px solid %(field_border)s;
                 border-radius: 3px;
                 min-height: 26px;
                 padding: 0 7px;
             }
             QFrame#controls QComboBox { padding-right: 29px; }
             QFrame#controls QComboBox:hover, QFrame#controls QSpinBox:hover, QFrame#controls QDoubleSpinBox:hover {
-                border-color: #66788b;
+                border-color: %(hover)s;
             }
             QFrame#controls QComboBox:focus, QFrame#controls QSpinBox:focus, QFrame#controls QDoubleSpinBox:focus {
-                border-color: #3074a8;
+                border-color: %(focus)s;
             }
             QFrame#controls QComboBox::drop-down {
-                background: #354454;
-                border-left: 1px solid #354454;
+                background: %(drop_down)s;
+                border-left: 1px solid %(drop_down)s;
                 width: 25px;
             }
             QFrame#controls QComboBox::down-arrow {
@@ -322,16 +416,9 @@ class MainWindow(QMainWindow):
                 width: 14px;
                 height: 14px;
             }
-            QComboBox QAbstractItemView {
-                color: #252b34;
-                background: #ffffff;
-                selection-color: #172a3b;
-                selection-background-color: #d5e7f7;
-                border: 1px solid #aeb7c2;
-                outline: none;
-            }
-        """
+        """ % colors
         self.setStyleSheet(styles.replace("CHEVRON_ICON", arrow_icon))
+        self.view.set_dark_theme(dark)
 
     def _action(self, text: str, shortcut: str, callback) -> QAction:
         action = QAction(text, self)
@@ -349,22 +436,29 @@ class MainWindow(QMainWindow):
     def _update_actions(self) -> None:
         ready = self.source is not None
         busy = self.worker is not None and self.worker.isRunning()
+        selecting = self._selection_active
         self.open_action.setEnabled(not busy)
         self.setup_action.setEnabled(not busy)
         self.generate_depth_action.setEnabled(ready and not busy)
         self.generate_normal_action.setEnabled(ready and not busy)
         self.generate_albedo_action.setEnabled(ready and not busy)
         self.generate_all_action.setEnabled(ready and not busy)
+        self.select_foliage_action.setEnabled(ready and not busy and not selecting)
         self.generate_menu.menuAction().setEnabled(ready and not busy)
         self.ai_fov.setEnabled(not busy)
         self.ai_smoothing.setEnabled(not busy)
         self.ai_details.setEnabled(not busy)
         self.export_action.setEnabled(
-            (self.editor is not None or self.ai_vectors is not None or self.albedo is not None)
-            and not busy
+            (self.editor is not None or self.ai_vectors is not None or self.albedo is not None
+             or self.foliage_mask is not None) and not busy and not selecting
         )
         self.undo_action.setEnabled(self.editor is not None and bool(self.editor.strokes) and not busy)
         self.redo_action.setEnabled(self.editor is not None and bool(self.editor.redo_strokes) and not busy)
+        controls_enabled = selecting and self._selection_ready and not self._selection_pending
+        self.selection_kind.setEnabled(controls_enabled)
+        self.selection_done.setEnabled(controls_enabled and self._selection_mask is not None)
+        self.selection_clear.setEnabled(controls_enabled and bool(self._selection_points))
+        self.selection_cancel.setEnabled(selecting)
 
     def open_file(self) -> None:
         last_directory = self._settings.value(self._last_open_directory_key, "", type=str)
@@ -378,18 +472,23 @@ class MainWindow(QMainWindow):
             return
         try:
             if path.lower().endswith(".ssoul"):
-                source_path, depth, _strength, convention = load_project(path)
+                source_path, depth, _strength, convention, foliage_mask = load_project(
+                    path, with_foliage_mask=True
+                )
                 source = open_png(source_path)
             else:
                 source_path = Path(path)
                 source = open_png(path)
                 depth = None
+                foliage_mask = None
             self.source_path = source_path
             self.source = source
             self.editor = DepthEditor(depth, source[..., 3]) if depth is not None else None
             self._preview_normal = None
             self.ai_vectors = None
             self.albedo = None
+            self.foliage_mask = foliage_mask
+            self._selection_mask = None
             self.ai_smoothing.setValue(1.5)
             self.ai_details.setValue(0.35)
             self.ai_fov.setValue(60)
@@ -409,6 +508,124 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"{source_path.name} — {source.shape[1]} × {source.shape[0]}")
         except Exception as exc:
             QMessageBox.critical(self, "Ошибка открытия", str(exc))
+
+    def start_foliage_selection(self) -> None:
+        if self.source is None or (self.worker is not None and self.worker.isRunning()):
+            return
+        if not self._confirm_model_download(("sam",)):
+            return
+        self._selection_active = True
+        self._selection_ready = False
+        self._selection_pending = False
+        self._selection_mask = None
+        self._selection_points = []
+        self._selection_labels = []
+        self.view.selection_enabled = False
+        self.mode.setCurrentText("Source")
+        self.worker = SamSelectionThread(self.source, self)
+        self._connect_worker_progress(self.worker)
+        self.worker.ready.connect(self._selection_ready_for_clicks)
+        self.worker.mask_generated.connect(self._selection_mask_generated)
+        self.worker.mask_failed.connect(self._selection_mask_failed)
+        self.worker.failed.connect(self._selection_setup_failed)
+        self.worker.finished.connect(self._generation_finished)
+        self.worker.start()
+        self.statusBar().showMessage("Подготовка SAM 2.1 для выделения листвы...")
+        self._refresh()
+        self._update_actions()
+
+    def _selection_ready_for_clicks(self) -> None:
+        self._selection_ready = True
+        self.view.selection_enabled = True
+        self.view.setDragMode(ImageView.NoDrag)
+        self.statusBar().showMessage("Кликните по листве. «Исключить» убирает лишние области.")
+        self._update_actions()
+
+    def _selection_click(self, x: int, y: int) -> None:
+        if (not self._selection_active or not self._selection_ready or self._selection_pending
+                or self.source is None):
+            return
+        if not (0 <= x < self.source.shape[1] and 0 <= y < self.source.shape[0]):
+            return
+        if self.source[y, x, 3] == 0:
+            self.statusBar().showMessage("Выберите непрозрачный пиксель листвы")
+            return
+        label = 1 if self.selection_kind.currentText() == "Добавить" else 0
+        if label == 0 and not any(self._selection_labels):
+            self.statusBar().showMessage("Сначала добавьте область листвы")
+            return
+        self._selection_points.append((x, y))
+        self._selection_labels.append(label)
+        self._selection_pending = True
+        assert isinstance(self.worker, SamSelectionThread)
+        self.worker.predict(self._selection_points, self._selection_labels)
+        self.statusBar().showMessage("SAM 2.1 уточняет маску...")
+        self._update_actions()
+
+    def _selection_mask_generated(self, mask: np.ndarray) -> None:
+        if self.source is None or mask.shape != self.source.shape[:2]:
+            self._selection_mask_failed("SAM 2.1 вернула маску неверного размера")
+            return
+        self._selection_mask = np.asarray(mask, dtype=bool) & (self.source[..., 3] > 0)
+        self._selection_pending = False
+        self.statusBar().showMessage("Маска листвы готова. Добавьте или исключите точки, затем нажмите «Готово».")
+        self._refresh()
+        self._update_actions()
+
+    def _selection_mask_failed(self, message: str) -> None:
+        if self._selection_points:
+            self._selection_points.pop()
+            self._selection_labels.pop()
+        self._selection_pending = False
+        self.statusBar().showMessage("Не удалось уточнить маску: " + message)
+        self._update_actions()
+
+    def _selection_setup_failed(self, message: str) -> None:
+        self._selection_active = False
+        self._selection_ready = False
+        self.view.selection_enabled = False
+        self._selection_mask = None
+        QMessageBox.critical(self, "Ошибка SAM 2.1", message)
+        self.statusBar().showMessage("Подготовка SAM 2.1 не удалась")
+        self._refresh()
+        self._update_actions()
+
+    def finish_foliage_selection(self) -> None:
+        if not self._selection_active or self._selection_mask is None or self._selection_pending:
+            return
+        self.foliage_mask = self._selection_mask.copy()
+        self.statusBar().showMessage("Маска листвы сохранена в проекте")
+        self._stop_foliage_selection()
+
+    def clear_foliage_selection(self) -> None:
+        if not self._selection_active or self._selection_pending:
+            return
+        self._selection_mask = None
+        self._selection_points.clear()
+        self._selection_labels.clear()
+        self.statusBar().showMessage("Точки и временная маска очищены")
+        self._refresh()
+        self._update_actions()
+
+    def cancel_foliage_selection(self) -> None:
+        if not self._selection_active:
+            return
+        self.statusBar().showMessage("Выделение листвы отменено")
+        self._stop_foliage_selection()
+
+    def _stop_foliage_selection(self) -> None:
+        self._selection_active = False
+        self._selection_ready = False
+        self._selection_pending = False
+        self._selection_mask = None
+        self._selection_points.clear()
+        self._selection_labels.clear()
+        self.view.selection_enabled = False
+        self.view.setDragMode(ImageView.ScrollHandDrag if self.tool.currentText() == "Pan" else ImageView.NoDrag)
+        if isinstance(self.worker, SamSelectionThread) and self.worker.isRunning():
+            self.worker.stop()
+        self._refresh()
+        self._update_actions()
 
     def generate(self) -> None:
         if self.source is None:
@@ -614,7 +831,11 @@ class MainWindow(QMainWindow):
         if mode == "Albedo":
             pixels = self.albedo if self.albedo is not None else self.source
         elif mode == "Source":
-            pixels = self.source
+            pixels = self._foliage_overlay(self.source, self._selection_mask) if (
+                self._selection_active and self._selection_mask is not None
+            ) else self.source
+        elif mode == "Foliage Mask":
+            pixels = self._foliage_preview()
         elif mode == "Depth":
             if self.editor is None:
                 pixels = self.source
@@ -637,6 +858,24 @@ class MainWindow(QMainWindow):
                 pixels = render_lighting(lighting_base, self._preview_normal, *self.light)
         self.view.set_pixels(pixels, fit)
         self._update_actions()
+
+    def _foliage_overlay(self, source: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        preview = source.copy()
+        # Cyan has clear contrast with the common green foliage palette.
+        rgb = preview[..., :3]
+        rgb[mask] = np.rint(
+            rgb[mask].astype(np.float32) * 0.55
+            + np.array((0, 220, 255), np.float32) * 0.45
+        ).astype(np.uint8)
+        return preview
+
+    def _foliage_preview(self) -> np.ndarray:
+        if self.foliage_mask is None:
+            return self.source
+        pixels = np.zeros_like(self.source)
+        pixels[..., :3] = np.where(self.foliage_mask[..., None], 255, 0).astype(np.uint8)
+        pixels[..., 3] = self.source[..., 3]
+        return pixels
 
     def _brush_event(self, phase: str, x: int, y: int) -> None:
         if self.editor is None or (self.worker is not None and self.worker.isRunning()):
@@ -673,7 +912,7 @@ class MainWindow(QMainWindow):
             self.view.fitInView(self.view.item, Qt.KeepAspectRatio)
 
     def export(self) -> None:
-        if self.editor is None and self.ai_vectors is None and self.albedo is None:
+        if self.editor is None and self.ai_vectors is None and self.albedo is None and self.foliage_mask is None:
             return
         default_directory = Path.cwd() / "generated"
         default_directory.mkdir(parents=True, exist_ok=True)
@@ -688,8 +927,13 @@ class MainWindow(QMainWindow):
                 )
                 project_path = Path(directory) / f"{self.source_path.stem}.ssoul"
                 save_project(project_path, self.source_path, self.editor.depth,
-                             20.0, self.convention.currentText())
+                             20.0, self.convention.currentText(), self.foliage_mask)
                 saved.extend((depth_path.name, project_path.name))
+            elif self.foliage_mask is not None:
+                project_path = Path(directory) / f"{self.source_path.stem}.ssoul"
+                save_project(project_path, self.source_path, None,
+                             20.0, self.convention.currentText(), self.foliage_mask)
+                saved.append(project_path.name)
             if self.ai_vectors is not None:
                 normal = self._selected_normal(self.convention.currentText())
                 normal_path = export_normal(self.source_path, normal, directory)

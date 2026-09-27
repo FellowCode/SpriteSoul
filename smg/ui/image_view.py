@@ -17,6 +17,7 @@ def image_from_array(pixels: np.ndarray) -> QImage:
 class ImageView(QGraphicsView):
     brush_event = Signal(str, int, int)
     light_changed = Signal(float, float)
+    selection_event = Signal(int, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -28,13 +29,18 @@ class ImageView(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.mode = "Source"
         self.tool = "Pan"
+        self.selection_enabled = False
         self._dragging = False
         self._has_image = False
+        self.set_dark_theme(False)
+
+    def set_dark_theme(self, dark: bool) -> None:
+        """Use a neutral transparency grid that does not glare in dark mode."""
         checker = QPixmap(24, 24)
-        checker.fill(QColor("#d9dce0"))
+        checker.fill(QColor("#2a303a" if dark else "#d9dce0"))
         painter = QPainter(checker)
-        painter.fillRect(0, 0, 12, 12, QColor("#f0f1f3"))
-        painter.fillRect(12, 12, 12, 12, QColor("#f0f1f3"))
+        painter.fillRect(0, 0, 12, 12, QColor("#363e4a" if dark else "#f0f1f3"))
+        painter.fillRect(12, 12, 12, 12, QColor("#363e4a" if dark else "#f0f1f3"))
         painter.end()
         self.setBackgroundBrush(QBrush(checker))
 
@@ -67,6 +73,9 @@ class ImageView(QGraphicsView):
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton and self._has_image:
+            if self.selection_enabled:
+                self.selection_event.emit(*self._position(event))
+                return
             if self.mode == "Depth" and self.tool != "Pan":
                 self._dragging = True
                 self.brush_event.emit("begin", *self._position(event))

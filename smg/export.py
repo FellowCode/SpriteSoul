@@ -50,25 +50,63 @@ def export_albedo(source_path: str | Path, albedo: np.ndarray,
     return albedo_path
 
 
-def save_project(path: str | Path, source_path: str | Path, depth: np.ndarray,
-                 normal_strength: float, convention: str) -> None:
+def _validated_foliage_mask(foliage_mask: np.ndarray | None,
+                            shape: tuple[int, int] | None = None) -> np.ndarray | None:
+    if foliage_mask is None:
+        return None
+    mask = np.asarray(foliage_mask, dtype=bool)
+    if mask.ndim != 2:
+        raise ValueError("Маска листвы должна быть двухмерной")
+    if shape is not None and mask.shape != shape:
+        raise ValueError("Размер маски листвы не соответствует исходному PNG")
+    return mask
+
+
+def save_project(path: str | Path, source_path: str | Path, depth: np.ndarray | None,
+                 normal_strength: float, convention: str,
+                 foliage_mask: np.ndarray | None = None) -> None:
     path = Path(path)
     relative_source = str(Path(source_path).resolve().relative_to(path.parent.resolve())) if Path(source_path).resolve().is_relative_to(path.parent.resolve()) else str(Path(source_path).resolve())
+    if depth is not None:
+        depth = np.asarray(depth, np.float32)
+    mask_shape = depth.shape if depth is not None else (
+        open_png(source_path).shape[:2] if foliage_mask is not None else None
+    )
+    mask = _validated_foliage_mask(foliage_mask, mask_shape)
+    fields = {
+        "source": relative_source,
+        "normal_strength": normal_strength,
+        "convention": convention,
+    }
+    if depth is not None:
+        fields["depth"] = depth
+    if mask is not None:
+        fields["foliage_mask"] = mask.astype(np.uint8)
     with path.open("wb") as file:
-        np.savez_compressed(file, source=relative_source, depth=depth.astype(np.float32),
-                            normal_strength=normal_strength, convention=convention)
+        np.savez_compressed(file, **fields)
 
 
-def load_project(path: str | Path) -> tuple[Path, np.ndarray, float, str]:
+def load_project(path: str | Path, *, with_foliage_mask: bool = False):
+    """Load a project, optionally including its persisted foliage selection.
+
+    The default four-item tuple is retained for existing callers and projects.
+    """
     path = Path(path)
     with np.load(path, allow_pickle=False) as project:
         source = Path(str(project["source"]))
         if not source.is_absolute():
             source = path.parent / source
-        depth = np.asarray(project["depth"], np.float32)
+        depth = np.asarray(project["depth"], np.float32) if "depth" in project else None
         strength = float(project["normal_strength"])
         convention = str(project["convention"])
+        foliage_mask = (
+            np.asarray(project["foliage_mask"], dtype=bool)
+            if "foliage_mask" in project else None
+        )
     rgba = open_png(source)
-    if depth.shape != rgba.shape[:2]:
+    if depth is not None and depth.shape != rgba.shape[:2]:
         raise ValueError("Размер проекта не соответствует исходному PNG")
+    foliage_mask = _validated_foliage_mask(foliage_mask, rgba.shape[:2])
+    if with_foliage_mask:
+        return source, depth, strength, convention, foliage_mask
     return source, depth, strength, convention

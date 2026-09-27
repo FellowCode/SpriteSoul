@@ -1,6 +1,7 @@
 import os
 
 import numpy as np
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QMessageBox
 from PySide6.QtWidgets import QApplication
 
@@ -62,6 +63,22 @@ def test_generate_menu_groups_all_map_actions():
     app.processEvents()
 
 
+def test_custom_controls_follow_system_color_scheme_without_styling_dialog_labels():
+    app = QApplication.instance() or QApplication([])
+    window = main_window.MainWindow()
+
+    window._apply_system_theme(Qt.ColorScheme.Dark)
+    dark_styles = window.styleSheet()
+    assert "background: #20252e" in dark_styles
+    assert "color: #e7edf5" in dark_styles
+    assert "\n            QLabel," not in dark_styles
+
+    window._apply_system_theme(Qt.ColorScheme.Light)
+    assert "background: #f5f6f8" in window.styleSheet()
+    window.close()
+    app.processEvents()
+
+
 def test_lighting_preview_prefers_albedo_and_falls_back_to_source(monkeypatch):
     app = QApplication.instance() or QApplication([])
     window = main_window.MainWindow()
@@ -85,5 +102,29 @@ def test_lighting_preview_prefers_albedo_and_falls_back_to_source(monkeypatch):
     window.albedo = None
     window._refresh()
     assert bases[-1] is window.source
+    window.close()
+    app.processEvents()
+
+
+def test_foliage_selection_is_confirmed_or_cancelled_without_overwriting_saved_mask():
+    app = QApplication.instance() or QApplication([])
+    window = main_window.MainWindow()
+    window.source = np.full((4, 5, 4), 255, np.uint8)
+    saved = np.zeros((4, 5), bool)
+    saved[0, 0] = True
+    candidate = np.zeros((4, 5), bool)
+    candidate[2, 3] = True
+    window.foliage_mask = saved.copy()
+    window._selection_active = True
+    window._selection_ready = True
+    window._selection_mask = candidate
+    window.finish_foliage_selection()
+    assert np.array_equal(window.foliage_mask, candidate)
+
+    window._selection_active = True
+    window._selection_ready = True
+    window._selection_mask = saved
+    window.cancel_foliage_selection()
+    assert np.array_equal(window.foliage_mask, candidate)
     window.close()
     app.processEvents()

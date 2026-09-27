@@ -70,7 +70,7 @@ def generate_albedo(rgba: np.ndarray, progress=None, strength: float = 1.0,
         for index, (image, _, _) in enumerate(prepared):
             Image.fromarray(image).save(input_dir / f"sprite_{index:04d}.png")
         if progress:
-            progress(f"IntrinsicAnything: анализ {len(regions)} спрайтов...")
+            progress("Генерация Albedo...")
         command = [str(python), str(root / "inference.py"), "--input_dir", str(input_dir),
                    "--output_dir", str(output_dir), "--model_dir", str(root / "weights/albedo"),
                    "--ddim", "100", "--batch_size", "1", "--splits_vertical", "1",
