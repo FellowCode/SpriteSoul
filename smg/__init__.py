@@ -1,0 +1,1 @@
+"""Sprite Soul image pipeline."""

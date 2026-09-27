@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: sprite-soul
+Version: 0.1.0
+Summary: Local depth and normal map editor for PNG sprites
+Requires-Python: <3.14,>=3.11
+Requires-Dist: numpy<3,>=1.26
+Requires-Dist: opencv-python-headless<5,>=4.9
+Requires-Dist: Pillow<12,>=10
+Requires-Dist: PySide6<7,>=6.7
+Requires-Dist: transformers<5,>=4.48
+Requires-Dist: torch<3,>=2.4
+Provides-Extra: test
+Requires-Dist: pytest<10,>=8; extra == "test"
