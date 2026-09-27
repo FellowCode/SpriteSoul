@@ -10,11 +10,17 @@ from smg.pipeline import open_png
 def export_maps(source_path: str | Path, depth: np.ndarray, normal: np.ndarray,
                 alpha: np.ndarray,
                 directory: str | Path) -> tuple[Path, Path]:
+    depth_path = export_depth(source_path, depth, alpha, directory)
+    normal_path = export_normal(source_path, normal, directory)
+    return depth_path, normal_path
+
+
+def export_depth(source_path: str | Path, depth: np.ndarray, alpha: np.ndarray,
+                 directory: str | Path) -> Path:
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     stem = Path(source_path).stem
     depth_path = directory / f"{stem}_depth.png"
-    normal_path = directory / f"{stem}_normal.png"
     depth_16 = np.rint(np.clip(depth, 0, 1) * 65535).astype(np.uint16)
     depth_rgba = np.empty((*depth.shape, 4), np.uint16)
     depth_rgba[..., :3] = depth_16[..., None]
@@ -23,8 +29,25 @@ def export_maps(source_path: str | Path, depth: np.ndarray, normal: np.ndarray,
     if not encoded:
         raise OSError(f"Не удалось сохранить {depth_path}")
     depth_path.write_bytes(png.tobytes())
+    return depth_path
+
+
+def export_normal(source_path: str | Path, normal: np.ndarray,
+                  directory: str | Path) -> Path:
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    normal_path = directory / f"{Path(source_path).stem}_normal.png"
     Image.fromarray(normal).save(normal_path)
-    return depth_path, normal_path
+    return normal_path
+
+
+def export_albedo(source_path: str | Path, albedo: np.ndarray,
+                  directory: str | Path) -> Path:
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    albedo_path = directory / f"{Path(source_path).stem}_albedo.png"
+    Image.fromarray(albedo).save(albedo_path)
+    return albedo_path
 
 
 def save_project(path: str | Path, source_path: str | Path, depth: np.ndarray,

@@ -70,25 +70,9 @@ Normal AI должна быть приведена точно к координ�
 
 Для atlas результат должен возвращаться точно в исходные координаты.
 
-# Режимы Normal
+# Режим Normal
 
-Добавь в интерфейс:
-
-`Normal Source`
-
-с режимами:
-
-1. `Depth`
-2. `AI`
-3. `Hybrid`
-
-## Depth
-
-Существующий режим.
-
-`Final Depth → gradient → Normal`
-
-Он остаётся основным и полностью детерминированным.
+В приложении используется только `AI Normal` от DSINE. Normal из Depth и смешанный режим удалены как недостаточно качественные.
 
 ## AI
 
@@ -96,6 +80,7 @@ Normal AI должна быть приведена точно к координ�
 
 - преобразования координат;
 - нормализации;
+- alpha-aware Gaussian smoothing с повторной нормализацией;
 - применения исходной alpha;
 - приведения к выбранной convention.
 
@@ -106,71 +91,19 @@ Normal AI должна быть приведена точно к координ�
 
 Не определяй знак Y визуально. Проверь преобразование координат DSINE по документации/коду модели.
 
-## Hybrid
-
-Не делай сложную систему fusion.
-
-Для первой реализации достаточно контролируемого смешивания направлений:
-
-`N = normalize((1-w) * N_depth + w * N_ai)`
-
-где:
-
-`w = AI Influence`
-
-диапазон:
-
-`0.0 ... 1.0`
-
-Default:
-
-`0.35`
-
-При:
-
-`w = 0`
-
-результат должен точно соответствовать `Depth Normal`.
-
-При:
-
-`w = 1`
-
-результат должен соответствовать нормализованной `AI Normal`.
-
-Смешивать нужно float XYZ vectors, а НЕ RGB-пиксели закодированной normal map.
-
-После смешивания обязательно нормализовать vector.
-
 # UI
 
 Не перестраивай интерфейс.
 
-Добавь к существующим настройкам Normal:
+Покажи фиксированный источник `AI (DSINE)` и настройку `Сглаживание: 0.0–8.0` с default `1.5`.
 
-`Normal Source: Depth / AI / Hybrid`
-
-`AI Influence: 0.00 – 1.00`
-
-Если DSINE ещё не запускалась, выбор `AI` или `Hybrid` должен запустить inference либо предложить Generate AI Normal.
-
-Добавь возможность визуально быстро переключаться:
-
-`Depth Normal ↔ AI Normal ↔ Hybrid`
-
-Lighting Preview должен использовать выбранную Normal Source.
+Если DSINE ещё не запускалась, генерация Normal должна запустить inference или предложить скачать модель. Lighting Preview использует AI Normal после сглаживания.
 
 # Работа с Depth Editor
 
 Ручное редактирование Depth НЕ изменяет AI Normal.
 
-После изменения Depth:
-
-- пересчитать `N_depth`;
-- если выбран Hybrid — пересчитать Hybrid;
-- DSINE повторно запускать не нужно.
-
-Таким образом пользователь может использовать AI Normal как стабильную геометрическую подсказку и исправлять Depth вручную.
+Изменение Depth не влияет на AI Normal и не запускает DSINE повторно. Карты Depth и AI Normal редактируются и экспортируются независимо.
 
 # Кэш
 
@@ -200,7 +133,7 @@ Normal AI должен быть отдельным компонентом от D
 
 `normal_ai.py` — DSINE inference;
 
-`normal.py` — normal-from-depth, conversion, normalization и Hybrid;
+`normal.py` — преобразование, нормализация и сглаживание AI Normal;
 
 не создавай plugin framework, factory hierarchy или dependency injection.
 
@@ -220,12 +153,12 @@ Normal AI должен быть отдельным компонентом от D
 
 Добавь только необходимые проверки:
 
-1. `Hybrid(w=0) == Depth Normal`
-2. `Hybrid(w=1) == AI Normal`
-3. длина каждого normal vector после Hybrid ≈ 1
-4. OpenGL/DirectX корректно меняет Y
-5. output dimensions == source dimensions
-6. output alpha == source alpha
+1. сглаживание подавляет локальные артефакты;
+2. длина каждого normal vector после сглаживания ≈ 1;
+3. прозрачный фон не размывается внутрь силуэта;
+4. OpenGL/DirectX корректно меняет Y;
+5. output dimensions == source dimensions;
+6. output alpha == source alpha.
 
 # Производительность
 
@@ -259,10 +192,6 @@ Depth/Normal post-processing выполнять без тяжёлой GPU-мод
 
 `DSINE → AI Normal`
 
-и:
-
-`Depth Normal + AI Normal → Hybrid`
-
 к уже существующему pipeline.
 
 Сохрани существующий рабочий функционал.
@@ -278,6 +207,6 @@ Depth/Normal post-processing выполнять без тяжёлой GPU-мод
 
 После реализации запусти приложение и существующие тесты, исправь реальные ошибки и проверь полный сценарий на одном PNG:
 
-`Open → Generate Depth → Generate AI Normal → Depth/AI/Hybrid → Lighting Preview → Export`.
+`Open → Generate AI Normal → Smoothing → Lighting Preview → Export`.
 
 Не останавливайся на написании кода — доведи интеграцию до рабочего состояния.

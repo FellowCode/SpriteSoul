@@ -5,6 +5,7 @@ import gc
 import numpy as np
 
 from smg.atlas import feather_weights, tile_positions
+from smg.model_paths import HUGGINGFACE_HUB_CACHE
 
 
 MODEL_ID = "depth-anything/Depth-Anything-V2-Small-hf"
@@ -23,8 +24,12 @@ class DepthModel:
 
         if not torch.cuda.is_available():
             raise RuntimeError("Для генерации Depth нужна NVIDIA CUDA. Проверьте установку CUDA-сборки PyTorch.")
-        self.processor = AutoImageProcessor.from_pretrained(MODEL_ID, use_fast=False)
-        self.model = AutoModelForDepthEstimation.from_pretrained(MODEL_ID)
+        self.processor = AutoImageProcessor.from_pretrained(
+            MODEL_ID, use_fast=False, cache_dir=HUGGINGFACE_HUB_CACHE
+        )
+        self.model = AutoModelForDepthEstimation.from_pretrained(
+            MODEL_ID, cache_dir=HUGGINGFACE_HUB_CACHE
+        )
         self.model.to("cuda").eval()
 
     def _infer(self, rgba: np.ndarray) -> np.ndarray:

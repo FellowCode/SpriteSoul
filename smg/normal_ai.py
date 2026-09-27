@@ -1,8 +1,7 @@
-"""On-demand DSINE inference using the upstream implementation outside the project tree."""
+"""On-demand DSINE inference using project-local source code and weights."""
 
 import gc
 import io
-import os
 import sys
 import urllib.request
 import zipfile
@@ -13,21 +12,30 @@ import cv2
 import numpy as np
 
 from smg.normal import dsine_to_opengl
+from smg.model_paths import HUGGINGFACE_HUB_CACHE, MODELS_ROOT
 
 
 # Pin upstream source so its constructor and checkpoint format remain compatible.
 DSINE_COMMIT = "ef0c2afa32b4dd19cb8ca4567c652802cd92591c"
 CHECKPOINT_REPO = "dylanebert/DSINE"
+DSINE_SOURCE_ROOT = MODELS_ROOT / f"DSINE-{DSINE_COMMIT}"
 
 
-def _source_root() -> Path:
-    cache = Path(os.environ.get("LOCALAPPDATA", Path.home() / ".cache")) / "SpriteSoul"
-    root = cache / f"DSINE-{DSINE_COMMIT}"
+def _source_root(progress=None) -> Path:
+    root = DSINE_SOURCE_ROOT
+    cache = root.parent
     if not (root / "models" / "dsine" / "v02.py").exists():
         cache.mkdir(parents=True, exist_ok=True)
         url = f"https://github.com/baegwangbin/DSINE/archive/{DSINE_COMMIT}.zip"
         with urllib.request.urlopen(url, timeout=120) as response:
-            archive = zipfile.ZipFile(io.BytesIO(response.read()))
+            data = io.BytesIO()
+            size = response.headers.get("Content-Length")
+            total = int(size) if size and size.isdigit() else None
+            while chunk := response.read(1024 * 1024):
+                data.write(chunk)
+                if progress:
+                    progress(data.tell(), total)
+            archive = zipfile.ZipFile(data)
             archive.extractall(cache)
         extracted = cache / f"DSINE-{DSINE_COMMIT}"
         if not (extracted / "models" / "dsine" / "v02.py").exists():
@@ -70,7 +78,9 @@ class DSINENormalModel:
             model = DSINE_v02(args)
         finally:
             geffnet.create_model = create_model
-        checkpoint = hf_hub_download(CHECKPOINT_REPO, "dsine.pt")
+        checkpoint = hf_hub_download(
+            CHECKPOINT_REPO, "dsine.pt", cache_dir=HUGGINGFACE_HUB_CACHE
+        )
         state = torch.load(checkpoint, map_location="cpu", weights_only=True)["model"]
         model.load_state_dict({key.removeprefix("module."): value for key, value in state.items()})
         return model.to("cuda").eval()
@@ -92,7 +102,14 @@ class DSINENormalModel:
         right = (32 - width % 32) % 32 - left
         top = (32 - height % 32) % 32 // 2
         bottom = (32 - height % 32) % 32 - top
-        tensor = F.pad(tensor, (left, right, top, bottom))
+        # A constant black frame creates rectangular seams in DSINE near the
+        # aligned 32-pixel boundary. Reflect the real image instead.
+        pad_mode = (
+            "reflect"
+            if width > max(left, right) and height > max(top, bottom)
+            else "replicate"
+        )
+        tensor = F.pad(tensor, (left, right, top, bottom), mode=pad_mode)
         mean = torch.tensor((0.485, 0.456, 0.406), device="cuda")[None, :, None, None]
         std = torch.tensor((0.229, 0.224, 0.225), device="cuda")[None, :, None, None]
         tensor = (tensor - mean) / std

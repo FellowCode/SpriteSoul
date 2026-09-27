@@ -1,11 +1,15 @@
 README.md
 pyproject.toml
 smg/__init__.py
+smg/__main__.py
 smg/atlas.py
+smg/cli.py
 smg/editor.py
 smg/export.py
 smg/normal.py
+smg/normal_ai.py
 smg/pipeline.py
+smg/setup.py
 smg/depth/__init__.py
 smg/depth/inference.py
 smg/depth/processing.py
@@ -18,7 +22,10 @@ smg/ui/icons/chevron-down.svg
 sprite_soul.egg-info/PKG-INFO
 sprite_soul.egg-info/SOURCES.txt
 sprite_soul.egg-info/dependency_links.txt
+sprite_soul.egg-info/entry_points.txt
 sprite_soul.egg-info/requires.txt
 sprite_soul.egg-info/top_level.txt
+tests/test_cli.py
 tests/test_normal.py
 tests/test_pipeline.py
+tests/test_setup.py

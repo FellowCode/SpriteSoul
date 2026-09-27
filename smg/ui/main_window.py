@@ -1,21 +1,23 @@
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QThread, Signal, Qt
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtCore import QSettings, QThread, Signal, Qt
+from PySide6.QtGui import QAction, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame,
-    QHBoxLayout, QLabel, QMainWindow, QMessageBox, QSlider,
+    QHBoxLayout, QLabel, QMainWindow, QMessageBox, QProgressBar, QSlider,
     QSpinBox, QStatusBar, QToolBar, QVBoxLayout, QWidget,
 )
 
 from smg.depth.inference import DepthModel
+from smg.albedo_ai import generate_albedo
 from smg.depth.processing import DepthSettings
 from smg.editor import DepthEditor
-from smg.export import export_maps, load_project, save_project
-from smg.normal import ai_normal, hybrid_normal, orient_ai_vectors
+from smg.export import export_albedo, export_depth, export_normal, load_project, save_project
+from smg.normal import ai_normal, orient_ai_vectors, postprocess_ai_vectors
 from smg.normal_ai import DSINENormalModel
-from smg.pipeline import generate_depth, generate_normal, open_png
+from smg.pipeline import generate_depth, open_png
+from smg.setup import MODEL_LABELS, missing_models, prepare_environment
 from smg.ui.image_view import ImageView
 from smg.ui.lighting_preview import render_lighting
 
@@ -24,6 +26,7 @@ class GenerateThread(QThread):
     generated = Signal(object)
     failed = Signal(str)
     progress = Signal(str)
+    progress_event = Signal(object)
 
     def __init__(self, rgba: np.ndarray, parent=None):
         super().__init__(parent)
@@ -31,6 +34,7 @@ class GenerateThread(QThread):
 
     def run(self) -> None:
         try:
+            prepare_environment(("depth",), self.progress.emit, events=self.progress_event.emit)
             depth = generate_depth(self.rgba, DepthModel(), self.progress.emit)
             self.generated.emit(depth)
         except Exception as exc:
@@ -41,6 +45,7 @@ class GenerateNormalThread(QThread):
     generated = Signal(object)
     failed = Signal(str)
     progress = Signal(str)
+    progress_event = Signal(object)
 
     def __init__(self, rgba: np.ndarray, fov: float, parent=None):
         super().__init__(parent)
@@ -49,29 +54,113 @@ class GenerateNormalThread(QThread):
 
     def run(self) -> None:
         try:
+            prepare_environment(("ai",), self.progress.emit, events=self.progress_event.emit)
             normal = DSINENormalModel(self.fov).generate(self.rgba, self.progress.emit)
             self.generated.emit(normal)
         except Exception as exc:
             self.failed.emit(str(exc))
 
 
+class SetupThread(QThread):
+    prepared = Signal()
+    failed = Signal(str)
+    progress = Signal(str)
+    progress_event = Signal(object)
+
+    def run(self) -> None:
+        try:
+            prepare_environment(
+                ("depth", "ai"), self.progress.emit, events=self.progress_event.emit
+            )
+            self.prepared.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class GenerateAlbedoThread(QThread):
+    generated = Signal(object)
+    failed = Signal(str)
+    progress = Signal(str)
+    progress_event = Signal(object)
+
+    def __init__(self, rgba: np.ndarray, parent=None):
+        super().__init__(parent)
+        self.rgba = rgba.copy()
+
+    def run(self) -> None:
+        try:
+            prepare_environment(
+                ("albedo",), self.progress.emit, install_cuda=False,
+                events=self.progress_event.emit,
+            )
+            self.generated.emit(generate_albedo(self.rgba, self.progress.emit))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class GenerateAllThread(QThread):
+    depth_generated = Signal(object)
+    normal_generated = Signal(object)
+    albedo_generated = Signal(object)
+    completed = Signal()
+    failed = Signal(str)
+    progress = Signal(str)
+    progress_event = Signal(object)
+
+    def __init__(self, rgba: np.ndarray, fov: float, parent=None):
+        super().__init__(parent)
+        self.rgba = rgba.copy()
+        self.fov = fov
+
+    def run(self) -> None:
+        try:
+            prepare_environment(
+                ("depth", "ai", "albedo"), self.progress.emit,
+                events=self.progress_event.emit,
+            )
+            self.progress.emit("Генерация карты глубины...")
+            self.depth_generated.emit(
+                generate_depth(self.rgba, DepthModel(), self.progress.emit)
+            )
+            self.progress.emit("Генерация карты нормалей...")
+            self.normal_generated.emit(
+                DSINENormalModel(self.fov).generate(self.rgba, self.progress.emit)
+            )
+            self.progress.emit("Генерация Albedo...")
+            self.albedo_generated.emit(generate_albedo(self.rgba, self.progress.emit))
+            self.completed.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class MainWindow(QMainWindow):
+    _settings = QSettings("SpriteSoul", "SpriteSoul")
+    _last_open_directory_key = "files/last_open_directory"
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Sprite Soul")
+        icon_path = Path(__file__).resolve().parent / "icons" / "sprite-soul.ico"
+        self.setWindowIcon(QIcon(str(icon_path)))
         self.resize(1180, 760)
         self.source_path: Path | None = None
         self.source: np.ndarray | None = None
         self.editor: DepthEditor | None = None
         self._preview_normal: np.ndarray | None = None
         self.ai_vectors: np.ndarray | None = None  # OpenGL float XYZ, converted at inference time
-        self.worker: GenerateThread | None = None
+        self.albedo: np.ndarray | None = None
+        self.worker: QThread | None = None
         self.light = (0.35, 0.45)
         self._building = True
         self._build_ui()
         self._building = False
         self._update_actions()
         self.setStatusBar(QStatusBar())
+        self.download_progress = QProgressBar(self)
+        self.download_progress.setFixedWidth(220)
+        self.download_progress.setTextVisible(True)
+        self.download_progress.hide()
+        self.statusBar().addPermanentWidget(self.download_progress)
         self.statusBar().showMessage("Откройте PNG для начала работы")
 
     def _build_ui(self) -> None:
@@ -79,13 +168,33 @@ class MainWindow(QMainWindow):
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
         self.open_action = self._action("Открыть", "Ctrl+O", self.open_file)
-        self.generate_action = self._action("Генерировать", "Ctrl+G", self.generate)
-        self.generate_ai_action = self._action("Генерировать AI Normal", "Ctrl+Shift+G", self.generate_ai_normal)
+        self.setup_action = self._action("Подготовить AI", "Ctrl+Shift+S", self.prepare_ai)
+        self.generate_depth_action = self._action("Карта глубины", "Ctrl+G", self.generate)
+        self.generate_normal_action = self._action(
+            "Карта нормалей", "Ctrl+Shift+G", self.generate_ai_normal
+        )
+        self.generate_albedo_action = self._action(
+            "Albedo", "Ctrl+Shift+A", self.generate_albedo
+        )
+        self.generate_all_action = self._action(
+            "Все карты", "Ctrl+Alt+G", self.generate_all
+        )
+        # Compatibility aliases for code that used the previous action names.
+        self.generate_action = self.generate_depth_action
+        self.generate_ai_action = self.generate_normal_action
+        self.generate_menu = self.menuBar().addMenu("Генерировать")
+        for action in (
+            self.generate_depth_action, self.generate_normal_action,
+            self.generate_albedo_action, self.generate_all_action,
+        ):
+            self.generate_menu.addAction(action)
         self.undo_action = self._action("Отменить", "Ctrl+Z", self.undo)
         self.redo_action = self._action("Повторить", "Ctrl+Y", self.redo)
         self.export_action = self._action("Экспорт", "Ctrl+E", self.export)
-        for action in (self.open_action, self.generate_action, self.generate_ai_action, self.undo_action,
-                       self.redo_action, self.export_action):
+        for action in (
+            self.open_action, self.setup_action, self.generate_menu.menuAction(),
+            self.undo_action, self.redo_action, self.export_action,
+        ):
             toolbar.addAction(action)
         toolbar.addSeparator()
         fit_action = self._action("Вписать", "Ctrl+0", self.fit_image)
@@ -111,7 +220,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(QLabel("Просмотр"))
         self.mode = QComboBox()
-        self.mode.addItems(("Source", "Depth", "Normal", "Lighting Preview"))
+        self.mode.addItems(("Source", "Albedo", "Depth", "Normal", "Lighting Preview"))
         self.mode.currentTextChanged.connect(self._mode_changed)
         layout.addWidget(self.mode)
 
@@ -131,23 +240,25 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("Normal"))
         normal_form = QFormLayout()
         layout.addLayout(normal_form)
-        self.normal_strength = self._slider(0, 1000, 200, self._normal_changed)
-        normal_form.addRow("Strength", self.normal_strength)
         self.convention = QComboBox()
         self.convention.addItems(("OpenGL", "DirectX"))
         self.convention.currentTextChanged.connect(self._normal_changed)
         normal_form.addRow("Format", self.convention)
-        self.normal_source = QComboBox()
-        self.normal_source.addItems(("Depth", "AI", "Hybrid"))
-        self.normal_source.currentTextChanged.connect(self._normal_source_changed)
-        normal_form.addRow("Normal Source", self.normal_source)
-        self.ai_influence = QDoubleSpinBox()
-        self.ai_influence.setRange(0, 1)
-        self.ai_influence.setSingleStep(0.01)
-        self.ai_influence.setDecimals(2)
-        self.ai_influence.setValue(0.35)
-        self.ai_influence.valueChanged.connect(self._normal_changed)
-        normal_form.addRow("AI Influence", self.ai_influence)
+        normal_form.addRow("Источник", QLabel("AI (DSINE)"))
+        self.ai_smoothing = QDoubleSpinBox()
+        self.ai_smoothing.setRange(0, 8)
+        self.ai_smoothing.setSingleStep(0.25)
+        self.ai_smoothing.setDecimals(2)
+        self.ai_smoothing.setValue(1.5)
+        self.ai_smoothing.valueChanged.connect(self._normal_changed)
+        normal_form.addRow("Сглаживание", self.ai_smoothing)
+        self.ai_details = QDoubleSpinBox()
+        self.ai_details.setRange(0, 1.5)
+        self.ai_details.setSingleStep(0.05)
+        self.ai_details.setDecimals(2)
+        self.ai_details.setValue(0.35)
+        self.ai_details.valueChanged.connect(self._normal_changed)
+        normal_form.addRow("Детали", self.ai_details)
         self.ai_fov = QSpinBox()
         self.ai_fov.setRange(20, 120)
         self.ai_fov.setValue(60)
@@ -239,20 +350,35 @@ class MainWindow(QMainWindow):
         ready = self.source is not None
         busy = self.worker is not None and self.worker.isRunning()
         self.open_action.setEnabled(not busy)
-        self.generate_action.setEnabled(ready and not busy)
-        self.generate_ai_action.setEnabled(ready and not busy)
+        self.setup_action.setEnabled(not busy)
+        self.generate_depth_action.setEnabled(ready and not busy)
+        self.generate_normal_action.setEnabled(ready and not busy)
+        self.generate_albedo_action.setEnabled(ready and not busy)
+        self.generate_all_action.setEnabled(ready and not busy)
+        self.generate_menu.menuAction().setEnabled(ready and not busy)
         self.ai_fov.setEnabled(not busy)
-        self.export_action.setEnabled(self.editor is not None and not busy)
+        self.ai_smoothing.setEnabled(not busy)
+        self.ai_details.setEnabled(not busy)
+        self.export_action.setEnabled(
+            (self.editor is not None or self.ai_vectors is not None or self.albedo is not None)
+            and not busy
+        )
         self.undo_action.setEnabled(self.editor is not None and bool(self.editor.strokes) and not busy)
         self.redo_action.setEnabled(self.editor is not None and bool(self.editor.redo_strokes) and not busy)
 
     def open_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Открыть PNG или проект", "", "Sprite Soul (*.png *.ssoul);;PNG (*.png);;Project (*.ssoul)")
+        last_directory = self._settings.value(self._last_open_directory_key, "", type=str)
+        if last_directory and not Path(last_directory).is_dir():
+            last_directory = ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Открыть PNG или проект", last_directory,
+            "Sprite Soul (*.png *.ssoul);;PNG (*.png);;Project (*.ssoul)",
+        )
         if not path:
             return
         try:
             if path.lower().endswith(".ssoul"):
-                source_path, depth, strength, convention = load_project(path)
+                source_path, depth, _strength, convention = load_project(path)
                 source = open_png(source_path)
             else:
                 source_path = Path(path)
@@ -263,8 +389,9 @@ class MainWindow(QMainWindow):
             self.editor = DepthEditor(depth, source[..., 3]) if depth is not None else None
             self._preview_normal = None
             self.ai_vectors = None
-            self.normal_source.setCurrentText("Depth")
-            self.ai_influence.setValue(0.35)
+            self.albedo = None
+            self.ai_smoothing.setValue(1.5)
+            self.ai_details.setValue(0.35)
             self.ai_fov.setValue(60)
             for widget, value in ((self.invert, False), (self.depth_strength, 100),
                                   (self.contrast, 100), (self.smooth, 0)):
@@ -273,13 +400,12 @@ class MainWindow(QMainWindow):
                 widget.blockSignals(False)
             self.mode.setCurrentText("Source")
             if depth is not None:
-                self.normal_strength.setValue(round(strength * 10))
                 self.convention.setCurrentText(convention)
             else:
-                self.normal_strength.setValue(200)
                 self.convention.setCurrentText("OpenGL")
             self._refresh(fit=True)
             self._update_actions()
+            self._settings.setValue(self._last_open_directory_key, str(Path(path).parent))
             self.statusBar().showMessage(f"{source_path.name} — {source.shape[1]} × {source.shape[0]}")
         except Exception as exc:
             QMessageBox.critical(self, "Ошибка открытия", str(exc))
@@ -287,24 +413,81 @@ class MainWindow(QMainWindow):
     def generate(self) -> None:
         if self.source is None:
             return
+        if not self._confirm_model_download(("depth",)):
+            return
         self.worker = GenerateThread(self.source, self)
-        self.worker.progress.connect(self.statusBar().showMessage)
+        self._connect_worker_progress(self.worker)
         self.worker.generated.connect(self._generated)
         self.worker.failed.connect(self._generation_failed)
         self.worker.finished.connect(self._generation_finished)
         self.worker.start()
         self._update_actions()
 
+    def prepare_ai(self) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            return
+        self.worker = SetupThread(self)
+        self._connect_worker_progress(self.worker)
+        self.worker.prepared.connect(lambda: self.statusBar().showMessage("CUDA и модели готовы"))
+        self.worker.failed.connect(self._setup_failed)
+        self.worker.finished.connect(self._generation_finished)
+        self.worker.start()
+        self._update_actions()
+
+    def _setup_failed(self, message: str) -> None:
+        QMessageBox.critical(self, "Ошибка подготовки AI", message)
+        self.statusBar().showMessage("Подготовка AI не удалась")
+
     def generate_ai_normal(self) -> None:
         if self.source is None or (self.worker is not None and self.worker.isRunning()):
             return
+        if not self._confirm_model_download(("ai",)):
+            return
         self.worker = GenerateNormalThread(self.source, self.ai_fov.value(), self)
-        self.worker.progress.connect(self.statusBar().showMessage)
+        self._connect_worker_progress(self.worker)
         self.worker.generated.connect(self._ai_generated)
         self.worker.failed.connect(self._generation_failed)
         self.worker.finished.connect(self._generation_finished)
         self.worker.start()
         self._update_actions()
+
+    def generate_albedo(self) -> None:
+        if self.source is None or (self.worker is not None and self.worker.isRunning()):
+            return
+        if not self._confirm_model_download(("albedo",)):
+            return
+        self.worker = GenerateAlbedoThread(self.source, self)
+        self._connect_worker_progress(self.worker)
+        self.worker.generated.connect(self._albedo_generated)
+        self.worker.failed.connect(self._generation_failed)
+        self.worker.finished.connect(self._generation_finished)
+        self.worker.start()
+        self._update_actions()
+
+    def generate_all(self) -> None:
+        if self.source is None or (self.worker is not None and self.worker.isRunning()):
+            return
+        if not self._confirm_model_download(("depth", "ai", "albedo")):
+            return
+        self.worker = GenerateAllThread(self.source, self.ai_fov.value(), self)
+        self._connect_worker_progress(self.worker)
+        self.worker.depth_generated.connect(self._generated)
+        self.worker.normal_generated.connect(self._ai_generated)
+        self.worker.albedo_generated.connect(self._albedo_generated)
+        self.worker.completed.connect(self._all_generated)
+        self.worker.failed.connect(self._generation_failed)
+        self.worker.finished.connect(self._generation_finished)
+        self.worker.start()
+        self._update_actions()
+
+    def _all_generated(self) -> None:
+        self.statusBar().showMessage("Все карты готовы")
+
+    def _albedo_generated(self, albedo: np.ndarray) -> None:
+        self.albedo = albedo
+        self.mode.setCurrentText("Albedo")
+        self._refresh()
+        self.statusBar().showMessage("Full-resolution Albedo готова")
 
     def _ai_generated(self, vectors: np.ndarray) -> None:
         if vectors.shape != (*self.source.shape[:2], 3):
@@ -312,6 +495,7 @@ class MainWindow(QMainWindow):
             return
         self.ai_vectors = vectors
         self._preview_normal = None
+        self.mode.setCurrentText("Normal")
         self._refresh()
         self.statusBar().showMessage("AI Normal готова")
 
@@ -326,7 +510,55 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Ошибка генерации", message)
         self.statusBar().showMessage("Генерация не удалась")
 
+    def _confirm_model_download(self, models: tuple[str, ...]) -> bool:
+        missing = missing_models(models)
+        if not missing:
+            return True
+        names = "\n".join(f"• {MODEL_LABELS[model]}" for model in missing)
+        note = ""
+        if "albedo" in missing:
+            note = "\n\nВес IntrinsicAnything составляет около 14,4 ГиБ."
+        answer = QMessageBox.question(
+            self,
+            "Требуется загрузка модели",
+            f"Для этой операции отсутствует модель:\n\n{names}"
+            f"{note}\n\nСкачать её в папку models проекта?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            self.statusBar().showMessage("Загрузка модели отменена")
+            return False
+        return True
+
+    def _connect_worker_progress(self, worker: QThread) -> None:
+        worker.progress.connect(self.statusBar().showMessage)
+        worker.progress_event.connect(self._show_progress_event)
+
+    def _show_progress_event(self, event: dict) -> None:
+        if event.get("phase") not in {"model_download", "pip_install"}:
+            return
+        status = event.get("status")
+        current = event.get("current")
+        total = event.get("total")
+        self.download_progress.show()
+        if status == "start":
+            self.download_progress.setRange(0, 0)
+            self.download_progress.setFormat("Загрузка…")
+        elif isinstance(current, int) and isinstance(total, int) and total > 0:
+            self.download_progress.setRange(0, total)
+            self.download_progress.setValue(min(current, total))
+            self.download_progress.setFormat("%p%")
+        else:
+            self.download_progress.setRange(0, 0)
+            self.download_progress.setFormat("Загрузка…")
+        if status in {"done", "cached", "ready"} and current == total and total is not None:
+            self.download_progress.setValue(total)
+
     def _generation_finished(self) -> None:
+        self.download_progress.hide()
+        self.download_progress.setRange(0, 100)
+        self.download_progress.setValue(0)
         self.worker.deleteLater()
         self.worker = None
         self._update_actions()
@@ -345,40 +577,26 @@ class MainWindow(QMainWindow):
             self._preview_normal = None
             self._refresh()
 
-    def _normal_source_changed(self, source: str) -> None:
-        self._normal_changed()
-        if source in ("AI", "Hybrid") and self.ai_vectors is None and self.source is not None:
-            self.generate_ai_normal()
-
     def _fov_changed(self) -> None:
         if self._building:
             return
         self.ai_vectors = None
         self._preview_normal = None
-        if self.normal_source.currentText() in ("AI", "Hybrid"):
+        if self.source is not None:
             self.generate_ai_normal()
 
     def _selected_normal(self, convention: str) -> np.ndarray:
         alpha = self.source[..., 3]
-        source = self.normal_source.currentText()
-        ai_vectors = self.ai_vectors
-        if ai_vectors is not None:
-            ai_vectors = orient_ai_vectors(ai_vectors, self.invert_ai_x.isChecked(),
-                                           self.invert_ai_y.isChecked())
-        if source == "AI":
-            if ai_vectors is None:
-                raise RuntimeError("Сначала сгенерируйте AI Normal")
-            return ai_normal(ai_vectors, alpha, convention)
-        if self.editor is None:
-            raise RuntimeError("Сначала сгенерируйте Depth")
-        depth_normal = generate_normal(self.editor.depth, self.source,
-                                       self.normal_strength.value() / 10, convention)
-        if source == "Depth":
-            return depth_normal
-        if ai_vectors is None:
+        if self.ai_vectors is None:
             raise RuntimeError("Сначала сгенерируйте AI Normal")
-        return hybrid_normal(depth_normal, ai_vectors, alpha,
-                             self.ai_influence.value(), convention)
+        ai_vectors = orient_ai_vectors(
+            self.ai_vectors, self.invert_ai_x.isChecked(), self.invert_ai_y.isChecked()
+        )
+        ai_vectors = postprocess_ai_vectors(
+            ai_vectors, self.source, self.ai_smoothing.value(),
+            self.ai_details.value(),
+        )
+        return ai_normal(ai_vectors, alpha, convention)
 
     def _mode_changed(self, mode: str) -> None:
         self.view.mode = mode
@@ -393,7 +611,9 @@ class MainWindow(QMainWindow):
             self.view.clear_image()
             return
         mode = self.mode.currentText()
-        if mode == "Source" or (self.editor is None and self.normal_source.currentText() != "AI"):
+        if mode == "Albedo":
+            pixels = self.albedo if self.albedo is not None else self.source
+        elif mode == "Source":
             pixels = self.source
         elif mode == "Depth":
             if self.editor is None:
@@ -406,14 +626,15 @@ class MainWindow(QMainWindow):
             pixels[..., :3] = grey[..., None]
             pixels[..., 3] = self.source[..., 3]
         else:
-            if self.normal_source.currentText() in ("AI", "Hybrid") and self.ai_vectors is None:
+            if self.ai_vectors is None:
                 pixels = self.source
             elif mode == "Normal":
                 pixels = self._selected_normal(self.convention.currentText())
             else:
                 if self._preview_normal is None:
                     self._preview_normal = self._selected_normal("OpenGL")
-                pixels = render_lighting(self.source, self._preview_normal, *self.light)
+                lighting_base = self.albedo if self.albedo is not None else self.source
+                pixels = render_lighting(lighting_base, self._preview_normal, *self.light)
         self.view.set_pixels(pixels, fit)
         self._update_actions()
 
@@ -452,19 +673,31 @@ class MainWindow(QMainWindow):
             self.view.fitInView(self.view.item, Qt.KeepAspectRatio)
 
     def export(self) -> None:
-        if self.editor is None:
+        if self.editor is None and self.ai_vectors is None and self.albedo is None:
             return
-        directory = QFileDialog.getExistingDirectory(self, "Папка экспорта", str(self.source_path.parent))
+        default_directory = Path.cwd() / "generated"
+        default_directory.mkdir(parents=True, exist_ok=True)
+        directory = QFileDialog.getExistingDirectory(self, "Папка экспорта", str(default_directory))
         if not directory:
             return
         try:
-            normal = self._selected_normal(self.convention.currentText())
-            depth_path, normal_path = export_maps(self.source_path, self.editor.depth, normal,
-                                                  self.source[..., 3], directory)
-            project_path = Path(directory) / f"{self.source_path.stem}.ssoul"
-            save_project(project_path, self.source_path, self.editor.depth,
-                         self.normal_strength.value() / 10, self.convention.currentText())
-            self.statusBar().showMessage(f"Сохранено: {depth_path.name}, {normal_path.name}, {project_path.name}")
+            saved = []
+            if self.editor is not None:
+                depth_path = export_depth(
+                    self.source_path, self.editor.depth, self.source[..., 3], directory
+                )
+                project_path = Path(directory) / f"{self.source_path.stem}.ssoul"
+                save_project(project_path, self.source_path, self.editor.depth,
+                             20.0, self.convention.currentText())
+                saved.extend((depth_path.name, project_path.name))
+            if self.ai_vectors is not None:
+                normal = self._selected_normal(self.convention.currentText())
+                normal_path = export_normal(self.source_path, normal, directory)
+                saved.append(normal_path.name)
+            if self.albedo is not None:
+                albedo_path = export_albedo(self.source_path, self.albedo, directory)
+                saved.append(albedo_path.name)
+            self.statusBar().showMessage("Сохранено: " + ", ".join(saved))
         except Exception as exc:
             QMessageBox.critical(self, "Ошибка экспорта", str(exc))
 

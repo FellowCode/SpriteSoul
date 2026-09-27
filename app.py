@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 
-from PySide6.QtGui import QFont, QFontDatabase
+from PySide6.QtGui import QFont, QFontDatabase, QIcon
 from PySide6.QtWidgets import QApplication
 
 from smg.ui.main_window import MainWindow
@@ -10,6 +10,8 @@ from smg.ui.main_window import MainWindow
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Sprite Soul")
+    icon_path = Path(__file__).resolve().parent / "smg" / "ui" / "icons" / "sprite-soul.ico"
+    app.setWindowIcon(QIcon(str(icon_path)))
     font_path = Path("C:/Windows/Fonts/segoeui.ttf")
     if font_path.exists():
         QFontDatabase.addApplicationFont(str(font_path))

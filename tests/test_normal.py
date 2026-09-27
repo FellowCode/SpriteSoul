@@ -1,6 +1,9 @@
 import numpy as np
 
-from smg.normal import ai_normal, dsine_to_opengl, hybrid_normal, normals_from_depth, orient_ai_vectors
+from smg.normal import (
+    ai_normal, dsine_to_opengl, normals_from_depth, orient_ai_vectors,
+    postprocess_ai_vectors, smooth_ai_vectors,
+)
 
 
 def test_flat_and_slopes():
@@ -29,10 +32,8 @@ def test_alpha_and_silhouette():
     assert np.max(np.abs(result[alpha > 0, :3].astype(int) - (128, 128, 255))) <= 1
 
 
-def test_ai_hybrid_endpoints_convention_and_alignment():
+def test_ai_convention_and_alignment():
     alpha = np.arange(35, dtype=np.uint8).reshape(5, 7) * 7
-    depth = np.tile(np.linspace(0, 1, 7, dtype=np.float32), (5, 1))
-    base = normals_from_depth(depth, alpha)
     raw_dsine = np.zeros((5, 7, 3), np.float32)
     raw_dsine[..., 1:] = (0.6, 0.8)  # DSINE +Y points down.
     vectors = dsine_to_opengl(raw_dsine)
@@ -42,11 +43,46 @@ def test_ai_hybrid_endpoints_convention_and_alignment():
     assert ai_gl.shape == (5, 7, 4)
     assert np.array_equal(ai_gl[..., 3], alpha)
     assert ai_gl[2, 3, 1] < 128 < ai_dx[2, 3, 1]
-    assert np.array_equal(hybrid_normal(base, vectors, alpha, 0), base)
-    assert np.array_equal(hybrid_normal(base, vectors, alpha, 1), ai_gl)
-    mixed = hybrid_normal(base, vectors, alpha, 0.35)
-    lengths = np.linalg.norm(mixed[..., :3].astype(np.float32) / 127.5 - 1, axis=-1)
-    assert np.allclose(lengths, 1, atol=0.01)
+
+
+def test_ai_smoothing_reduces_local_artifacts_without_alpha_bleed():
+    alpha = np.zeros((17, 17), np.uint8)
+    alpha[3:14, 3:14] = 255
+    vectors = np.zeros((17, 17, 3), np.float32)
+    vectors[..., 2] = 1
+    vectors[8, 8] = (1, 0, 0)  # A one-pixel inference artifact.
+    smoothed = smooth_ai_vectors(vectors, alpha, sigma=1.5)
+    assert 0 < smoothed[8, 8, 0] < 1
+    assert smoothed[8, 8, 2] > 0.9
+    assert np.allclose(np.linalg.norm(smoothed, axis=-1), 1, atol=1e-5)
+    assert np.allclose(smoothed[alpha == 0], (0, 0, 1))
+
+
+def test_ai_postprocess_restores_normalized_detail_without_touching_silhouette():
+    rgba = np.zeros((33, 41, 4), np.uint8)
+    rgba[5:28, 7:34, 3] = 255
+    # A narrow painted ridge is below the useful detail scale of the AI normal.
+    rgba[5:28, 7:34, :3] = 96
+    rgba[5:28, 19:22, :3] = 220
+    vectors = np.zeros((33, 41, 3), np.float32)
+    vectors[..., 2] = 1
+
+    detailed = postprocess_ai_vectors(
+        vectors, rgba, smoothing=0, detail_strength=0.4,
+    )
+    assert detailed.shape == vectors.shape
+    assert np.max(np.abs(detailed[10:23, 16:25, 0])) > 0.1
+    assert np.allclose(np.linalg.norm(detailed, axis=-1), 1, atol=1e-5)
+    assert np.allclose(detailed[rgba[..., 3] == 0], (0, 0, 1))
+    flat_rgba = rgba.copy()
+    flat_rgba[flat_rgba[..., 3] > 0, :3] = 96
+    silhouette = postprocess_ai_vectors(
+        vectors, flat_rgba, smoothing=0, detail_strength=0.4,
+    )
+    assert np.max(np.abs(silhouette[..., :2])) < 1e-5
+    # With details disabled, the original broad AI orientation is unchanged.
+    plain = postprocess_ai_vectors(vectors, rgba, smoothing=0, detail_strength=0)
+    assert np.allclose(plain, vectors)
 
 
 def test_ai_axis_corrections_are_independent():

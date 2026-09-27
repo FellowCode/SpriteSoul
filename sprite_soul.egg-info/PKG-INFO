@@ -8,6 +8,6 @@ Requires-Dist: opencv-python-headless<5,>=4.9
 Requires-Dist: Pillow<12,>=10
 Requires-Dist: PySide6<7,>=6.7
 Requires-Dist: transformers<5,>=4.48
-Requires-Dist: torch<3,>=2.4
+Requires-Dist: huggingface-hub<1,>=0.36
 Provides-Extra: test
 Requires-Dist: pytest<10,>=8; extra == "test"
