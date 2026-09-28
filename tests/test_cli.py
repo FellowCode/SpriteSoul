@@ -18,7 +18,7 @@ def _source(path):
 
 
 def test_cli_from_depth_map_preserves_size_alpha_and_project(tmp_path, monkeypatch):
-    from smg import normal_ai, setup
+    from smg import normal_ai, segmentation, setup
 
     monkeypatch.setattr(setup, "prepare_environment", lambda models, progress, events=None: None)
 
@@ -32,6 +32,7 @@ def test_cli_from_depth_map_preserves_size_alpha_and_project(tmp_path, monkeypat
             return vectors
 
     monkeypatch.setattr(normal_ai, "DSINENormalModel", FakeAI)
+    monkeypatch.setattr(segmentation, "detect_tree_crown", lambda rgba, progress: None)
     source = tmp_path / "sprite.png"
     rgba = _source(source)
     values = np.tile(np.linspace(0, 65535, 11, dtype=np.uint16), (8, 1))
@@ -68,6 +69,29 @@ def test_cli_uses_generated_directory_by_default(tmp_path, monkeypatch):
     assert (tmp_path / "generated" / "sprite_depth.png").exists()
 
 
+def test_cli_ao_from_existing_depth_map_skips_model(tmp_path, monkeypatch):
+    from smg import setup
+    from smg.depth import inference
+
+    monkeypatch.setattr(setup, "prepare_environment", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Model setup is unnecessary")))
+    monkeypatch.setattr(inference, "DepthModel", lambda: (_ for _ in ()).throw(AssertionError("Model is unnecessary")))
+    source = tmp_path / "sprite.png"
+    rgba = _source(source)
+    values = np.full(rgba.shape[:2], 220, np.uint8)
+    values[3:5, 4:7] = 40
+    depth_map = tmp_path / "depth.png"
+    assert cv2.imwrite(str(depth_map), values)
+
+    output = tmp_path / "out"
+    assert main([str(source), "-o", str(output), "--maps", "ao",
+                 "--depth-map", str(depth_map)]) == 0
+    ao = open_png(output / "sprite_ao.png")
+    assert ao.shape == rgba.shape
+    assert np.array_equal(ao[..., 3], rgba[..., 3])
+    assert ao[3, 5, 0] < ao[2, 3, 0]
+    assert not (output / "sprite_depth.png").exists()
+
+
 def test_cli_batch_and_existing_output(tmp_path, monkeypatch):
     from smg.depth import inference
     from smg import setup
@@ -96,7 +120,7 @@ def test_cli_batch_and_existing_output(tmp_path, monkeypatch):
 
 
 def test_cli_ai_only_skips_depth_model(tmp_path, monkeypatch):
-    from smg import normal_ai
+    from smg import normal_ai, segmentation
     from smg import setup
     from smg.depth import inference
 
@@ -118,12 +142,13 @@ def test_cli_ai_only_skips_depth_model(tmp_path, monkeypatch):
 
     monkeypatch.setattr(inference, "DepthModel", NoDepth)
     monkeypatch.setattr(normal_ai, "DSINENormalModel", FakeAI)
+    monkeypatch.setattr(segmentation, "detect_tree_crown", lambda rgba, progress: None)
     source = tmp_path / "sprite.png"
     rgba = _source(source)
     output = tmp_path / "out"
     assert main([str(source), "-o", str(output), "--maps", "normal",
                  "--normal-source", "ai", "--no-invert-ai-x"]) == 0
-    assert prepared == [("ai",)]
+    assert prepared == [("ai", "clipseg")]
     normal = open_png(output / "sprite_normal.png")
     assert normal[3, 3, 0] > 128 and normal[3, 3, 1] > 128
     assert np.array_equal(normal[..., 3], rgba[..., 3])
@@ -154,6 +179,78 @@ def test_cli_round_trip_preserves_project_foliage_mask(tmp_path):
     )
     assert np.array_equal(saved_depth, depth)
     assert np.array_equal(restored, mask)
+
+
+def test_cli_applies_saved_crown_mask_to_ai_normal(tmp_path, monkeypatch):
+    from smg import normal_ai, setup
+
+    monkeypatch.setattr(setup, "prepare_environment", lambda models, progress, events=None: None)
+
+    class FlatAI:
+        def __init__(self, fov):
+            pass
+
+        def generate(self, rgba, progress=None):
+            vectors = np.zeros((*rgba.shape[:2], 3), np.float32)
+            vectors[..., 2] = 1
+            return vectors
+
+    monkeypatch.setattr(normal_ai, "DSINENormalModel", FlatAI)
+    source = tmp_path / "tree.png"
+    rgba = np.full((54, 62, 4), 120, np.uint8)
+    rgba[..., 3] = 255
+    Image.fromarray(rgba).save(source)
+    mask = np.zeros(rgba.shape[:2], bool)
+    mask[7:47, 9:53] = True
+    project = tmp_path / "tree.ssoul"
+    save_project(project, source, None, 20.0, "OpenGL", foliage_mask=mask)
+
+    assert main([str(project), "-o", str(tmp_path / "out"), "--maps", "normal"]) == 0
+    normal = open_png(tmp_path / "out" / "tree_normal.png")
+    assert normal[27, 16, 0] < 100 < normal[27, 46, 0]
+    assert normal[27, 4, 0] == 128
+
+
+def test_cli_auto_detects_tree_and_saves_crown_mask(tmp_path, monkeypatch):
+    from smg import normal_ai, segmentation, setup
+
+    prepared = []
+    monkeypatch.setattr(setup, "prepare_environment",
+                        lambda models, progress, events=None: prepared.append(tuple(models)))
+
+    class FlatAI:
+        def __init__(self, fov):
+            pass
+
+        def generate(self, rgba, progress=None):
+            vectors = np.zeros((*rgba.shape[:2], 3), np.float32)
+            vectors[..., 2] = 1
+            return vectors
+
+    monkeypatch.setattr(normal_ai, "DSINENormalModel", FlatAI)
+    source = tmp_path / "tree.png"
+    rgba = np.full((54, 62, 4), 120, np.uint8)
+    rgba[..., 3] = 255
+    Image.fromarray(rgba).save(source)
+    mask = np.zeros(rgba.shape[:2], bool)
+    mask[7:47, 9:53] = True
+    monkeypatch.setattr(segmentation, "detect_tree_crown", lambda rgba, progress: mask)
+    depth_map = tmp_path / "depth.png"
+    assert cv2.imwrite(str(depth_map), np.full(rgba.shape[:2], 128, np.uint8))
+    output = tmp_path / "out"
+    assert main([str(source), "-o", str(output), "--maps", "normal",
+                 "--depth-map", str(depth_map), "--save-project"]) == 0
+    assert prepared == [("ai", "clipseg")]
+    normal = open_png(output / "tree_normal.png")
+    assert normal[27, 16, 0] < 100 < normal[27, 46, 0]
+    *_, restored = load_project(output / "tree.ssoul", with_foliage_mask=True)
+    assert np.array_equal(restored, mask)
+
+    monkeypatch.setattr(segmentation, "detect_tree_crown", lambda rgba, progress: None)
+    output2 = tmp_path / "other"
+    assert main([str(source), "-o", str(output2), "--maps", "normal"]) == 0
+    plain = open_png(output2 / "tree_normal.png")
+    assert plain[27, 16, 0] == 128
 
 
 def test_cli_json_result_and_error_stream(tmp_path, capsys):

@@ -68,8 +68,8 @@ def _add_generate_args(parser: argparse.ArgumentParser) -> None:
                         help="исходные PNG или сохранённые проекты .ssoul")
     parser.add_argument("-o", "--output", default=Path("generated"), type=Path, metavar="DIR",
                         help="каталог для экспортируемых карт (по умолчанию: ./generated)")
-    parser.add_argument("--maps", choices=("both", "depth", "normal", "albedo", "all"), default="both",
-                        help="какие карты записать (по умолчанию: both; all добавляет Albedo)")
+    parser.add_argument("--maps", choices=("both", "depth", "normal", "albedo", "ao", "all"), default="both",
+                        help="какие карты записать (по умолчанию: both; all добавляет AO и Albedo)")
     parser.add_argument("--depth-map", type=Path, metavar="PNG",
                         help="готовая серая карта глубины для одного исходного PNG; пропускает Depth AI")
     parser.add_argument("--normal-source", choices=("ai",), default="ai",
@@ -83,6 +83,10 @@ def _add_generate_args(parser: argparse.ArgumentParser) -> None:
                         help="контраст глубины, 0.25–3 (по умолчанию: 1)")
     parser.add_argument("--depth-smooth", type=_bounded_float(0, 8), default=0.0,
                         help="сглаживание глубины, sigma 0–8 (по умолчанию: 0)")
+    parser.add_argument("--ao-radius", type=int, default=24,
+                        help="радиус AO в пикселях, 1–128 (по умолчанию: 24)")
+    parser.add_argument("--ao-strength", type=_bounded_float(0, 4), default=2.0,
+                        help="сила AO, 0–4 (по умолчанию: 2)")
     parser.add_argument("--ai-smoothing", type=_bounded_float(0, 8), default=1.5,
                         help="сглаживание AI-нормалей, sigma 0–8 (по умолчанию: 1.5)")
     parser.add_argument("--ai-details", type=_bounded_float(0, 1.5), default=0.35,
@@ -125,7 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Установить CUDA-сборку PyTorch и заранее скачать модели.",
         epilog="Пример: sprite-soul setup --models depth --progress json",
     )
-    setup.add_argument("--models", choices=("all", "depth", "ai", "sam", "none"), default="all",
+    setup.add_argument("--models", choices=("all", "depth", "ai", "clipseg", "none"), default="all",
                        help="какие модели скачать (по умолчанию: all)")
     setup.add_argument("--skip-cuda", action="store_true",
                        help="скачать модели без проверки и установки CUDA")
@@ -136,7 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _setup_command(args: argparse.Namespace, reporter: Reporter) -> int:
     from smg.setup import prepare_environment
 
-    models = ("depth", "ai", "sam") if args.models == "all" else (() if args.models == "none" else (args.models,))
+    models = ("depth", "ai", "clipseg") if args.models == "all" else (() if args.models == "none" else (args.models,))
     try:
         prepare_environment(models, reporter.text, install_cuda=not args.skip_cuda,
                             events=reporter.emit)
@@ -154,13 +158,16 @@ def _setup_command(args: argparse.Namespace, reporter: Reporter) -> int:
 
 def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
              reporter: Reporter) -> list[Path]:
+    from smg.ao import ao_from_depth
     from smg.depth.inference import DepthModel
     from smg.albedo_ai import generate_albedo
+    from smg.crown_normal import compose_crown_normals
     from smg.depth.processing import DepthSettings, process_depth
-    from smg.export import export_albedo, export_depth, export_normal, load_project, save_project
+    from smg.export import export_albedo, export_ao, export_depth, export_normal, load_project, save_project
     from smg.normal import ai_normal, orient_ai_vectors, postprocess_ai_vectors
     from smg.normal_ai import DSINENormalModel
     from smg.pipeline import generate_depth, open_depth_png, open_png
+    from smg.segmentation import detect_tree_crown
     from smg.setup import prepare_environment
 
     if path.suffix.lower() == ".ssoul":
@@ -177,7 +184,8 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
     wants_depth = args.maps in ("both", "depth", "all")
     wants_normal = args.maps in ("both", "normal", "all")
     wants_albedo = args.maps in ("albedo", "all")
-    needs_depth = wants_depth or args.save_project
+    wants_ao = args.maps in ("ao", "all")
+    needs_depth = wants_depth or wants_ao or args.save_project
     paths = []
     if wants_depth:
         paths.append(output / f"{stem}_depth.png")
@@ -185,6 +193,8 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
         paths.append(output / f"{stem}_normal.png")
     if wants_albedo:
         paths.append(output / f"{stem}_albedo.png")
+    if wants_ao:
+        paths.append(output / f"{stem}_ao.png")
     if args.save_project:
         paths.append(output / f"{stem}.ssoul")
     for target in paths:
@@ -203,6 +213,8 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
         models.append("depth")
     if wants_normal:
         models.append("ai")
+        if foliage_mask is None:
+            models.append("clipseg")
     if models:
         prepare_environment(models, reporter.text, events=reporter.emit)
 
@@ -217,6 +229,8 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
 
     normal = None
     if wants_normal:
+        if foliage_mask is None:
+            foliage_mask = detect_tree_crown(rgba, progress)
         convention = "OpenGL" if args.convention == "opengl" else "DirectX"
         progress("Генерация AI Normal...")
         vectors = DSINENormalModel(args.dsine_fov).generate(rgba, progress)
@@ -226,10 +240,16 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
         vectors = postprocess_ai_vectors(
             vectors, rgba, args.ai_smoothing, args.ai_details,
         )
+        if foliage_mask is not None:
+            vectors = compose_crown_normals(vectors, foliage_mask, rgba[..., 3])
         normal = ai_normal(vectors, rgba[..., 3], convention)
 
     if wants_depth:
         export_depth(source_path, depth, rgba[..., 3], output)
+    if wants_ao:
+        progress("Расчёт AO из Depth...")
+        ao = ao_from_depth(depth, rgba[..., 3], args.ao_radius, args.ao_strength)
+        export_ao(source_path, ao, rgba[..., 3], output)
     if wants_normal:
         export_normal(source_path, normal, output)
     if wants_albedo:
@@ -268,6 +288,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--depth-map допустим только с одним исходным PNG")
     if args.albedo_debug and args.maps not in ("albedo", "all"):
         parser.error("--albedo-debug применяется только при экспорте Albedo")
+    if args.ao_radius < 1 or args.ao_radius > 128:
+        parser.error("--ao-radius должен быть от 1 до 128")
     failed = 0
     processed = 0
     reserved: set[Path] = set()

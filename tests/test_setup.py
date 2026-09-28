@@ -37,12 +37,12 @@ def test_setup_prepares_albedo_on_demand(monkeypatch):
     assert calls == ["albedo"]
 
 
-def test_setup_prepares_sam_on_demand_and_uses_cuda(monkeypatch):
+def test_setup_prepares_clipseg_on_demand_and_uses_cuda(monkeypatch):
     calls = []
     monkeypatch.setattr(setup, "ensure_cuda", lambda progress, events=None: calls.append("cuda"))
-    monkeypatch.setattr(setup, "_prepare_sam", lambda progress, events: calls.append("sam"))
-    setup.prepare_environment(("sam",))
-    assert calls == ["cuda", "sam"]
+    monkeypatch.setattr(setup, "_model_file", lambda repo, name: calls.append((repo, name)))
+    setup.prepare_environment(("clipseg",))
+    assert calls == ["cuda", *((setup.CLIPSEG_MODEL_ID, name) for name in setup.CLIPSEG_FILES)]
 
 
 def test_setup_installs_cuda_wheel_only_when_needed(monkeypatch):
@@ -75,12 +75,28 @@ def test_setup_cli_dispatch(monkeypatch):
     assert calls == [(("ai",), False)]
 
 
-def test_setup_cli_accepts_sam(monkeypatch):
+def test_setup_cli_accepts_clipseg(monkeypatch):
     calls = []
     monkeypatch.setattr(setup, "prepare_environment", lambda models, progress, install_cuda, events=None:
                         calls.append((models, install_cuda)))
-    assert main(["setup", "--models", "sam", "--skip-cuda"]) == 0
-    assert calls == [(("sam",), False)]
+    assert main(["setup", "--models", "clipseg", "--skip-cuda"]) == 0
+    assert calls == [(("clipseg",), False)]
+
+
+def test_setup_cli_all_includes_clipseg(monkeypatch):
+    calls = []
+    monkeypatch.setattr(setup, "prepare_environment", lambda models, progress, install_cuda, events=None:
+                        calls.append(models))
+    assert main(["setup", "--models", "all", "--skip-cuda"]) == 0
+    assert calls == [("depth", "ai", "clipseg")]
+
+
+def test_clipseg_availability_checks_every_required_file(monkeypatch):
+    checked = []
+    monkeypatch.setattr(setup, "_cached_model_file", lambda repo, name:
+                        checked.append((repo, name)) or True)
+    assert setup.model_available("clipseg")
+    assert checked == [(setup.CLIPSEG_MODEL_ID, name) for name in setup.CLIPSEG_FILES]
 
 
 def test_cuda_installed_but_unavailable_reports_driver_issue(monkeypatch):

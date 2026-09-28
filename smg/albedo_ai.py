@@ -17,6 +17,31 @@ from smg.model_paths import INTRINSIC_ROOT
 DEFAULT_INTRINSIC_ROOT = INTRINSIC_ROOT
 
 
+def _enable_low_vram(root: Path) -> None:
+    """Keep the diffusion model in fp16 and autocast its inference operations."""
+    replacements = (
+        (root / "models" / "matfusion.py",
+         "    model.eval().to(device)",
+         "    model.eval().half().to(device)"),
+        (root / "inference.py",
+         "    model.generation(dps_scale=args.guidance, uc_score=1, \n"
+         "                     ddim_steps=args.ddim, batch_size=args.batch_size, n_samples=1)",
+         "    with torch.autocast(\"cuda\", dtype=torch.float16):\n"
+         "        model.generation(dps_scale=args.guidance, uc_score=1, \n"
+         "                         ddim_steps=args.ddim, batch_size=args.batch_size, n_samples=1)"),
+    )
+    updates = []
+    for path, original, patched in replacements:
+        source = path.read_text(encoding="utf-8")
+        if patched in source:
+            continue
+        if source.count(original) != 1:
+            raise RuntimeError(f"Не удалось включить экономию VRAM для IntrinsicAnything: {path}")
+        updates.append((path, source.replace(original, patched)))
+    for path, source in updates:
+        path.write_text(source, encoding="utf-8")
+
+
 def _experiment() -> tuple[Path, Path]:
     configured = os.environ.get("SPRITE_SOUL_INTRINSIC_ROOT")
     root = Path(configured).expanduser() if configured else DEFAULT_INTRINSIC_ROOT
@@ -26,6 +51,7 @@ def _experiment() -> tuple[Path, Path]:
             f"Не найдена установка IntrinsicAnything: {root}. "
             "Поместите её в models/IntrinsicAnything или укажите SPRITE_SOUL_INTRINSIC_ROOT."
         )
+    _enable_low_vram(root)
     return root, python
 
 

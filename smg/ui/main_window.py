@@ -1,5 +1,4 @@
 from pathlib import Path
-from queue import Queue
 
 import numpy as np
 from PySide6.QtCore import QSettings, QThread, Signal, Qt
@@ -11,14 +10,16 @@ from PySide6.QtWidgets import (
 )
 
 from smg.depth.inference import DepthModel
+from smg.ao import ao_from_depth
 from smg.albedo_ai import generate_albedo
+from smg.crown_normal import compose_crown_normals
 from smg.depth.processing import DepthSettings
 from smg.editor import DepthEditor
-from smg.export import export_albedo, export_depth, export_normal, load_project, save_project
+from smg.export import export_albedo, export_ao, export_depth, export_normal, load_project, save_project
 from smg.normal import ai_normal, orient_ai_vectors, postprocess_ai_vectors
 from smg.normal_ai import DSINENormalModel
 from smg.pipeline import generate_depth, open_png
-from smg.segmentation import SamSession
+from smg.segmentation import crown_mask, detect_tree_crown, expand_crown_mask, predict_crown_scores
 from smg.setup import MODEL_LABELS, missing_models, prepare_environment
 from smg.ui.image_view import ImageView
 from smg.ui.lighting_preview import render_lighting
@@ -49,16 +50,22 @@ class GenerateNormalThread(QThread):
     progress = Signal(str)
     progress_event = Signal(object)
 
-    def __init__(self, rgba: np.ndarray, fov: float, parent=None):
+    def __init__(self, rgba: np.ndarray, fov: float,
+                 foliage_mask: np.ndarray | None = None, parent=None):
         super().__init__(parent)
         self.rgba = rgba.copy()
         self.fov = fov
+        self.foliage_mask = None if foliage_mask is None else foliage_mask.copy()
 
     def run(self) -> None:
         try:
-            prepare_environment(("ai",), self.progress.emit, events=self.progress_event.emit)
+            models = ("ai", "clipseg") if self.foliage_mask is None else ("ai",)
+            prepare_environment(models, self.progress.emit, events=self.progress_event.emit)
+            crown = self.foliage_mask
+            if crown is None:
+                crown = detect_tree_crown(self.rgba, self.progress.emit)
             normal = DSINENormalModel(self.fov).generate(self.rgba, self.progress.emit)
-            self.generated.emit(normal)
+            self.generated.emit((normal, crown))
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -72,19 +79,17 @@ class SetupThread(QThread):
     def run(self) -> None:
         try:
             prepare_environment(
-                ("depth", "ai", "sam"), self.progress.emit, events=self.progress_event.emit
+                ("depth", "ai", "clipseg"), self.progress.emit, events=self.progress_event.emit
             )
             self.prepared.emit()
         except Exception as exc:
             self.failed.emit(str(exc))
 
 
-class SamSelectionThread(QThread):
-    """Keep SAM on a worker thread while the user refines one mask."""
+class CrownDetectionThread(QThread):
+    """Run one CLIPSeg inference without blocking the interface."""
 
-    ready = Signal()
-    mask_generated = Signal(object)
-    mask_failed = Signal(str)
+    scores_generated = Signal(object)
     failed = Signal(str)
     progress = Signal(str)
     progress_event = Signal(object)
@@ -92,34 +97,13 @@ class SamSelectionThread(QThread):
     def __init__(self, rgba: np.ndarray, parent=None):
         super().__init__(parent)
         self.rgba = rgba.copy()
-        self.requests: Queue = Queue()
-
-    def predict(self, points: list[tuple[int, int]], labels: list[int]) -> None:
-        self.requests.put(("predict", points.copy(), labels.copy()))
-
-    def stop(self) -> None:
-        self.requests.put(("stop",))
 
     def run(self) -> None:
-        session = None
         try:
-            prepare_environment(("sam",), self.progress.emit, events=self.progress_event.emit)
-            session = SamSession(self.rgba)
-            session.open(self.progress.emit)
-            self.ready.emit()
-            while True:
-                request = self.requests.get()
-                if request[0] == "stop":
-                    break
-                try:
-                    self.mask_generated.emit(session.predict(request[1], request[2]))
-                except Exception as exc:
-                    self.mask_failed.emit(str(exc))
+            prepare_environment(("clipseg",), self.progress.emit, events=self.progress_event.emit)
+            self.scores_generated.emit(predict_crown_scores(self.rgba, self.progress.emit))
         except Exception as exc:
             self.failed.emit(str(exc))
-        finally:
-            if session is not None:
-                session.close()
 
 
 class GenerateAlbedoThread(QThread):
@@ -152,15 +136,20 @@ class GenerateAllThread(QThread):
     progress = Signal(str)
     progress_event = Signal(object)
 
-    def __init__(self, rgba: np.ndarray, fov: float, parent=None):
+    def __init__(self, rgba: np.ndarray, fov: float,
+                 foliage_mask: np.ndarray | None = None, parent=None):
         super().__init__(parent)
         self.rgba = rgba.copy()
         self.fov = fov
+        self.foliage_mask = None if foliage_mask is None else foliage_mask.copy()
 
     def run(self) -> None:
         try:
+            models = ("depth", "ai", "albedo")
+            if self.foliage_mask is None:
+                models += ("clipseg",)
             prepare_environment(
-                ("depth", "ai", "albedo"), self.progress.emit,
+                models, self.progress.emit,
                 events=self.progress_event.emit,
             )
             self.progress.emit("Генерация карты глубины...")
@@ -168,8 +157,11 @@ class GenerateAllThread(QThread):
                 generate_depth(self.rgba, DepthModel(), self.progress.emit)
             )
             self.progress.emit("Генерация карты нормалей...")
+            crown = self.foliage_mask
+            if crown is None:
+                crown = detect_tree_crown(self.rgba, self.progress.emit)
             self.normal_generated.emit(
-                DSINENormalModel(self.fov).generate(self.rgba, self.progress.emit)
+                (DSINENormalModel(self.fov).generate(self.rgba, self.progress.emit), crown)
             )
             self.progress.emit("Генерация Albedo...")
             self.albedo_generated.emit(generate_albedo(self.rgba, self.progress.emit))
@@ -191,17 +183,18 @@ class MainWindow(QMainWindow):
         self.source_path: Path | None = None
         self.source: np.ndarray | None = None
         self.editor: DepthEditor | None = None
+        self._preview_ao: np.ndarray | None = None
+        self._show_ao_after_generation = False
         self._preview_normal: np.ndarray | None = None
         self.ai_vectors: np.ndarray | None = None  # OpenGL float XYZ, converted at inference time
         self.albedo: np.ndarray | None = None
         self.worker: QThread | None = None
         self.foliage_mask: np.ndarray | None = None
+        self._selection_scores: np.ndarray | None = None
         self._selection_mask: np.ndarray | None = None
-        self._selection_points: list[tuple[int, int]] = []
-        self._selection_labels: list[int] = []
         self._selection_active = False
-        self._selection_ready = False
         self._selection_pending = False
+        self._mode_before_selection = "Source"
         self.light = (0.35, 0.45)
         self._building = True
         self._build_ui()
@@ -225,6 +218,7 @@ class MainWindow(QMainWindow):
         self.open_action = self._action("Открыть", "Ctrl+O", self.open_file)
         self.setup_action = self._action("Подготовить AI", "Ctrl+Shift+S", self.prepare_ai)
         self.generate_depth_action = self._action("Карта глубины", "Ctrl+G", self.generate)
+        self.generate_ao_action = self._action("Карта AO", "Ctrl+Shift+O", self.generate_ao)
         self.generate_normal_action = self._action(
             "Карта нормалей", "Ctrl+Shift+G", self.generate_ai_normal
         )
@@ -235,14 +229,14 @@ class MainWindow(QMainWindow):
             "Все карты", "Ctrl+Alt+G", self.generate_all
         )
         self.select_foliage_action = self._action(
-            "Выделить листву", "Ctrl+Shift+L", self.start_foliage_selection
+            "Определить крону", "Ctrl+Shift+L", self.start_foliage_selection
         )
         # Compatibility aliases for code that used the previous action names.
         self.generate_action = self.generate_depth_action
         self.generate_ai_action = self.generate_normal_action
         self.generate_menu = self.menuBar().addMenu("Генерировать")
         for action in (
-            self.generate_depth_action, self.generate_normal_action,
+            self.generate_depth_action, self.generate_ao_action, self.generate_normal_action,
             self.generate_albedo_action, self.generate_all_action,
         ):
             self.generate_menu.addAction(action)
@@ -266,7 +260,6 @@ class MainWindow(QMainWindow):
         self.view = ImageView()
         self.view.brush_event.connect(self._brush_event)
         self.view.light_changed.connect(self._light_changed)
-        self.view.selection_event.connect(self._selection_click)
         row.addWidget(self.view, 1)
 
         panel = QFrame()
@@ -279,7 +272,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(QLabel("Просмотр"))
         self.mode = QComboBox()
-        self.mode.addItems(("Source", "Albedo", "Depth", "Normal", "Lighting Preview", "Foliage Mask"))
+        self.mode.addItems(("Source", "Albedo", "Depth", "AO", "Normal", "Lighting Preview", "Маска кроны"))
         self.mode.currentTextChanged.connect(self._mode_changed)
         layout.addWidget(self.mode)
 
@@ -295,6 +288,21 @@ class MainWindow(QMainWindow):
         form.addRow("Range", self.depth_strength)
         form.addRow("Contrast", self.contrast)
         form.addRow("Smooth", self.smooth)
+
+        layout.addWidget(QLabel("Ambient Occlusion"))
+        ao_form = QFormLayout()
+        layout.addLayout(ao_form)
+        self.ao_radius = QSpinBox()
+        self.ao_radius.setRange(1, 128)
+        self.ao_radius.setValue(24)
+        self.ao_radius.valueChanged.connect(self._ao_changed)
+        ao_form.addRow("Радиус", self.ao_radius)
+        self.ao_strength = QDoubleSpinBox()
+        self.ao_strength.setRange(0, 4)
+        self.ao_strength.setSingleStep(0.1)
+        self.ao_strength.setValue(2.0)
+        self.ao_strength.valueChanged.connect(self._ao_changed)
+        ao_form.addRow("Сила", self.ao_strength)
 
         layout.addWidget(QLabel("Normal"))
         normal_form = QFormLayout()
@@ -333,20 +341,23 @@ class MainWindow(QMainWindow):
         self.invert_ai_y.toggled.connect(self._normal_changed)
         normal_form.addRow(self.invert_ai_y)
 
-        layout.addWidget(QLabel("Листва (SAM 2.1)"))
+        layout.addWidget(QLabel("Крона (CLIPSeg)"))
         selection_form = QFormLayout()
         layout.addLayout(selection_form)
-        self.selection_kind = QComboBox()
-        self.selection_kind.addItems(("Добавить", "Исключить"))
-        selection_form.addRow("Клик", self.selection_kind)
+        self.selection_threshold = QSlider(Qt.Horizontal)
+        self.selection_threshold.setRange(0, 100)
+        self.selection_threshold.setValue(50)
+        self.selection_threshold.valueChanged.connect(self._selection_threshold_changed)
+        self.selection_threshold_label = QLabel("0.50")
+        threshold_row = QHBoxLayout()
+        threshold_row.addWidget(self.selection_threshold)
+        threshold_row.addWidget(self.selection_threshold_label)
+        selection_form.addRow("Порог", threshold_row)
         self.selection_done = QPushButton("Готово")
         self.selection_done.clicked.connect(self.finish_foliage_selection)
-        self.selection_clear = QPushButton("Очистить")
-        self.selection_clear.clicked.connect(self.clear_foliage_selection)
         self.selection_cancel = QPushButton("Отмена")
         self.selection_cancel.clicked.connect(self.cancel_foliage_selection)
         selection_form.addRow(self.selection_done)
-        selection_form.addRow(self.selection_clear)
         selection_form.addRow(self.selection_cancel)
 
         layout.addWidget(QLabel("Кисть"))
@@ -437,27 +448,31 @@ class MainWindow(QMainWindow):
         ready = self.source is not None
         busy = self.worker is not None and self.worker.isRunning()
         selecting = self._selection_active
-        self.open_action.setEnabled(not busy)
-        self.setup_action.setEnabled(not busy)
-        self.generate_depth_action.setEnabled(ready and not busy)
-        self.generate_normal_action.setEnabled(ready and not busy)
-        self.generate_albedo_action.setEnabled(ready and not busy)
-        self.generate_all_action.setEnabled(ready and not busy)
+        self.open_action.setEnabled(not busy and not selecting)
+        self.setup_action.setEnabled(not busy and not selecting)
+        self.generate_depth_action.setEnabled(ready and not busy and not selecting)
+        self.generate_ao_action.setEnabled(ready and not busy and not selecting)
+        self.generate_normal_action.setEnabled(ready and not busy and not selecting)
+        self.generate_albedo_action.setEnabled(ready and not busy and not selecting)
+        self.generate_all_action.setEnabled(ready and not busy and not selecting)
         self.select_foliage_action.setEnabled(ready and not busy and not selecting)
-        self.generate_menu.menuAction().setEnabled(ready and not busy)
-        self.ai_fov.setEnabled(not busy)
-        self.ai_smoothing.setEnabled(not busy)
-        self.ai_details.setEnabled(not busy)
+        self.generate_menu.menuAction().setEnabled(ready and not busy and not selecting)
+        self.mode.setEnabled(not selecting)
+        self.ai_fov.setEnabled(not busy and not selecting)
+        self.ai_smoothing.setEnabled(not busy and not selecting)
+        self.ai_details.setEnabled(not busy and not selecting)
         self.export_action.setEnabled(
             (self.editor is not None or self.ai_vectors is not None or self.albedo is not None
              or self.foliage_mask is not None) and not busy and not selecting
         )
-        self.undo_action.setEnabled(self.editor is not None and bool(self.editor.strokes) and not busy)
-        self.redo_action.setEnabled(self.editor is not None and bool(self.editor.redo_strokes) and not busy)
-        controls_enabled = selecting and self._selection_ready and not self._selection_pending
-        self.selection_kind.setEnabled(controls_enabled)
-        self.selection_done.setEnabled(controls_enabled and self._selection_mask is not None)
-        self.selection_clear.setEnabled(controls_enabled and bool(self._selection_points))
+        self.undo_action.setEnabled(self.editor is not None and bool(self.editor.strokes)
+                                    and not busy and not selecting)
+        self.redo_action.setEnabled(self.editor is not None and bool(self.editor.redo_strokes)
+                                    and not busy and not selecting)
+        controls_enabled = selecting and self._selection_scores is not None and not self._selection_pending
+        self.selection_threshold.setEnabled(controls_enabled)
+        self.selection_done.setEnabled(controls_enabled and self._selection_mask is not None
+                                       and bool(np.any(self._selection_mask)))
         self.selection_cancel.setEnabled(selecting)
 
     def open_file(self) -> None:
@@ -484,10 +499,12 @@ class MainWindow(QMainWindow):
             self.source_path = source_path
             self.source = source
             self.editor = DepthEditor(depth, source[..., 3]) if depth is not None else None
+            self._preview_ao = None
             self._preview_normal = None
             self.ai_vectors = None
             self.albedo = None
             self.foliage_mask = foliage_mask
+            self._selection_scores = None
             self._selection_mask = None
             self.ai_smoothing.setValue(1.5)
             self.ai_details.setValue(0.35)
@@ -512,126 +529,91 @@ class MainWindow(QMainWindow):
     def start_foliage_selection(self) -> None:
         if self.source is None or (self.worker is not None and self.worker.isRunning()):
             return
-        if not self._confirm_model_download(("sam",)):
+        if not self._confirm_model_download(("clipseg",)):
             return
         self._selection_active = True
-        self._selection_ready = False
-        self._selection_pending = False
+        self._selection_pending = True
+        self._selection_scores = None
         self._selection_mask = None
-        self._selection_points = []
-        self._selection_labels = []
-        self.view.selection_enabled = False
+        self.selection_threshold.setValue(50)
+        self._mode_before_selection = self.mode.currentText()
         self.mode.setCurrentText("Source")
-        self.worker = SamSelectionThread(self.source, self)
+        self.worker = CrownDetectionThread(self.source, self)
         self._connect_worker_progress(self.worker)
-        self.worker.ready.connect(self._selection_ready_for_clicks)
-        self.worker.mask_generated.connect(self._selection_mask_generated)
-        self.worker.mask_failed.connect(self._selection_mask_failed)
+        self.worker.scores_generated.connect(self._selection_scores_generated)
         self.worker.failed.connect(self._selection_setup_failed)
         self.worker.finished.connect(self._generation_finished)
         self.worker.start()
-        self.statusBar().showMessage("Подготовка SAM 2.1 для выделения листвы...")
+        self.statusBar().showMessage("CLIPSeg определяет крону...")
         self._refresh()
         self._update_actions()
 
-    def _selection_ready_for_clicks(self) -> None:
-        self._selection_ready = True
-        self.view.selection_enabled = True
-        self.view.setDragMode(ImageView.NoDrag)
-        self.statusBar().showMessage("Кликните по листве. «Исключить» убирает лишние области.")
-        self._update_actions()
-
-    def _selection_click(self, x: int, y: int) -> None:
-        if (not self._selection_active or not self._selection_ready or self._selection_pending
-                or self.source is None):
+    def _selection_scores_generated(self, scores: np.ndarray) -> None:
+        if not self._selection_active:
             return
-        if not (0 <= x < self.source.shape[1] and 0 <= y < self.source.shape[0]):
+        if self.source is None or scores.shape != self.source.shape[:2]:
+            self._selection_setup_failed("CLIPSeg вернула карту неверного размера")
             return
-        if self.source[y, x, 3] == 0:
-            self.statusBar().showMessage("Выберите непрозрачный пиксель листвы")
-            return
-        label = 1 if self.selection_kind.currentText() == "Добавить" else 0
-        if label == 0 and not any(self._selection_labels):
-            self.statusBar().showMessage("Сначала добавьте область листвы")
-            return
-        self._selection_points.append((x, y))
-        self._selection_labels.append(label)
-        self._selection_pending = True
-        assert isinstance(self.worker, SamSelectionThread)
-        self.worker.predict(self._selection_points, self._selection_labels)
-        self.statusBar().showMessage("SAM 2.1 уточняет маску...")
-        self._update_actions()
-
-    def _selection_mask_generated(self, mask: np.ndarray) -> None:
-        if self.source is None or mask.shape != self.source.shape[:2]:
-            self._selection_mask_failed("SAM 2.1 вернула маску неверного размера")
-            return
-        self._selection_mask = np.asarray(mask, dtype=bool) & (self.source[..., 3] > 0)
+        self._selection_scores = np.asarray(scores, dtype=np.float32)
         self._selection_pending = False
-        self.statusBar().showMessage("Маска листвы готова. Добавьте или исключите точки, затем нажмите «Готово».")
+        self._selection_threshold_changed(self.selection_threshold.value())
+        self.statusBar().showMessage("Настройте порог и нажмите «Готово».")
+
+    def _selection_threshold_changed(self, value: int) -> None:
+        self.selection_threshold_label.setText(f"{value / 100:.2f}")
+        if self._selection_scores is None or self.source is None or not self._selection_active:
+            return
+        seed = crown_mask(
+            self._selection_scores, self.source[..., 3], value / 100,
+        )
+        self._selection_mask = expand_crown_mask(seed, self.source)
         self._refresh()
-        self._update_actions()
-
-    def _selection_mask_failed(self, message: str) -> None:
-        if self._selection_points:
-            self._selection_points.pop()
-            self._selection_labels.pop()
-        self._selection_pending = False
-        self.statusBar().showMessage("Не удалось уточнить маску: " + message)
         self._update_actions()
 
     def _selection_setup_failed(self, message: str) -> None:
-        self._selection_active = False
-        self._selection_ready = False
-        self.view.selection_enabled = False
-        self._selection_mask = None
-        QMessageBox.critical(self, "Ошибка SAM 2.1", message)
-        self.statusBar().showMessage("Подготовка SAM 2.1 не удалась")
-        self._refresh()
-        self._update_actions()
+        if not self._selection_active:
+            return
+        self._stop_foliage_selection()
+        QMessageBox.critical(self, "Ошибка CLIPSeg", message)
+        self.statusBar().showMessage("Определить крону не удалось")
 
     def finish_foliage_selection(self) -> None:
-        if not self._selection_active or self._selection_mask is None or self._selection_pending:
+        if (not self._selection_active or self._selection_mask is None or self._selection_pending
+                or not np.any(self._selection_mask)):
             return
         self.foliage_mask = self._selection_mask.copy()
-        self.statusBar().showMessage("Маска листвы сохранена в проекте")
+        self._preview_normal = None
         self._stop_foliage_selection()
-
-    def clear_foliage_selection(self) -> None:
-        if not self._selection_active or self._selection_pending:
-            return
-        self._selection_mask = None
-        self._selection_points.clear()
-        self._selection_labels.clear()
-        self.statusBar().showMessage("Точки и временная маска очищены")
-        self._refresh()
-        self._update_actions()
+        if self.ai_vectors is not None:
+            self.mode.setCurrentText("Normal")
+            self.statusBar().showMessage("Нормаль кроны обновлена. Нажмите «Экспорт», чтобы сохранить карты.")
+        else:
+            self.statusBar().showMessage("Маска кроны готова. Нажмите «Экспорт», чтобы сохранить проект.")
 
     def cancel_foliage_selection(self) -> None:
         if not self._selection_active:
             return
-        self.statusBar().showMessage("Выделение листвы отменено")
         self._stop_foliage_selection()
+        self.mode.setCurrentText(self._mode_before_selection)
+        self.statusBar().showMessage("Определение кроны отменено")
 
     def _stop_foliage_selection(self) -> None:
         self._selection_active = False
-        self._selection_ready = False
         self._selection_pending = False
+        self._selection_scores = None
         self._selection_mask = None
-        self._selection_points.clear()
-        self._selection_labels.clear()
-        self.view.selection_enabled = False
-        self.view.setDragMode(ImageView.ScrollHandDrag if self.tool.currentText() == "Pan" else ImageView.NoDrag)
-        if isinstance(self.worker, SamSelectionThread) and self.worker.isRunning():
-            self.worker.stop()
         self._refresh()
         self._update_actions()
 
     def generate(self) -> None:
+        self._start_depth_generation(False)
+
+    def _start_depth_generation(self, show_ao: bool) -> None:
         if self.source is None:
             return
         if not self._confirm_model_download(("depth",)):
             return
+        self._show_ao_after_generation = show_ao
         self.worker = GenerateThread(self.source, self)
         self._connect_worker_progress(self.worker)
         self.worker.generated.connect(self._generated)
@@ -639,6 +621,15 @@ class MainWindow(QMainWindow):
         self.worker.finished.connect(self._generation_finished)
         self.worker.start()
         self._update_actions()
+
+    def generate_ao(self) -> None:
+        if self.source is None or (self.worker is not None and self.worker.isRunning()):
+            return
+        if self.editor is not None:
+            self.mode.setCurrentText("AO")
+            self._refresh()
+            return
+        self._start_depth_generation(True)
 
     def prepare_ai(self) -> None:
         if self.worker is not None and self.worker.isRunning():
@@ -658,9 +649,12 @@ class MainWindow(QMainWindow):
     def generate_ai_normal(self) -> None:
         if self.source is None or (self.worker is not None and self.worker.isRunning()):
             return
-        if not self._confirm_model_download(("ai",)):
+        models = ("ai", "clipseg") if self.foliage_mask is None else ("ai",)
+        if not self._confirm_model_download(models):
             return
-        self.worker = GenerateNormalThread(self.source, self.ai_fov.value(), self)
+        self.worker = GenerateNormalThread(
+            self.source, self.ai_fov.value(), self.foliage_mask, self,
+        )
         self._connect_worker_progress(self.worker)
         self.worker.generated.connect(self._ai_generated)
         self.worker.failed.connect(self._generation_failed)
@@ -684,9 +678,14 @@ class MainWindow(QMainWindow):
     def generate_all(self) -> None:
         if self.source is None or (self.worker is not None and self.worker.isRunning()):
             return
-        if not self._confirm_model_download(("depth", "ai", "albedo")):
+        models = ("depth", "ai", "albedo")
+        if self.foliage_mask is None:
+            models += ("clipseg",)
+        if not self._confirm_model_download(models):
             return
-        self.worker = GenerateAllThread(self.source, self.ai_fov.value(), self)
+        self.worker = GenerateAllThread(
+            self.source, self.ai_fov.value(), self.foliage_mask, self,
+        )
         self._connect_worker_progress(self.worker)
         self.worker.depth_generated.connect(self._generated)
         self.worker.normal_generated.connect(self._ai_generated)
@@ -706,10 +705,13 @@ class MainWindow(QMainWindow):
         self._refresh()
         self.statusBar().showMessage("Full-resolution Albedo готова")
 
-    def _ai_generated(self, vectors: np.ndarray) -> None:
+    def _ai_generated(self, result: np.ndarray | tuple[np.ndarray, np.ndarray | None]) -> None:
+        vectors, crown = result if isinstance(result, tuple) else (result, None)
         if vectors.shape != (*self.source.shape[:2], 3):
             self._generation_failed("DSINE вернула неверный размер Normal")
             return
+        if crown is not None:
+            self.foliage_mask = crown.copy()
         self.ai_vectors = vectors
         self._preview_normal = None
         self.mode.setCurrentText("Normal")
@@ -718,12 +720,15 @@ class MainWindow(QMainWindow):
 
     def _generated(self, depth: np.ndarray) -> None:
         self.editor = DepthEditor(depth, self.source[..., 3])
+        self._preview_ao = None
         self._preview_normal = None
-        self.mode.setCurrentText("Depth")
+        self.mode.setCurrentText("AO" if self._show_ao_after_generation else "Depth")
+        self._show_ao_after_generation = False
         self._settings_changed()
         self.statusBar().showMessage("Depth готова. При необходимости поправьте кистью.")
 
     def _generation_failed(self, message: str) -> None:
+        self._show_ao_after_generation = False
         QMessageBox.critical(self, "Ошибка генерации", message)
         self.statusBar().showMessage("Генерация не удалась")
 
@@ -786,6 +791,7 @@ class MainWindow(QMainWindow):
         settings = DepthSettings(self.invert.isChecked(), self.depth_strength.value() / 100,
                                  self.contrast.value() / 100, self.smooth.value() / 10)
         self.editor.set_settings(settings)
+        self._preview_ao = None
         self._preview_normal = None
         self._refresh()
 
@@ -793,6 +799,20 @@ class MainWindow(QMainWindow):
         if not self._building:
             self._preview_normal = None
             self._refresh()
+
+    def _ao_changed(self) -> None:
+        if not self._building:
+            self._preview_ao = None
+            if self.mode.currentText() in ("AO", "Lighting Preview"):
+                self._refresh()
+
+    def _selected_ao(self) -> np.ndarray:
+        if self._preview_ao is None:
+            self._preview_ao = ao_from_depth(
+                self.editor.depth, self.source[..., 3],
+                self.ao_radius.value(), self.ao_strength.value(),
+            )
+        return self._preview_ao
 
     def _fov_changed(self) -> None:
         if self._building:
@@ -813,6 +833,10 @@ class MainWindow(QMainWindow):
             ai_vectors, self.source, self.ai_smoothing.value(),
             self.ai_details.value(),
         )
+        if self.foliage_mask is not None:
+            ai_vectors = compose_crown_normals(
+                ai_vectors, self.foliage_mask, alpha,
+            )
         return ai_normal(ai_vectors, alpha, convention)
 
     def _mode_changed(self, mode: str) -> None:
@@ -834,15 +858,15 @@ class MainWindow(QMainWindow):
             pixels = self._foliage_overlay(self.source, self._selection_mask) if (
                 self._selection_active and self._selection_mask is not None
             ) else self.source
-        elif mode == "Foliage Mask":
+        elif mode == "Маска кроны":
             pixels = self._foliage_preview()
-        elif mode == "Depth":
+        elif mode in ("Depth", "AO"):
             if self.editor is None:
                 pixels = self.source
                 self.view.set_pixels(pixels, fit)
                 self._update_actions()
                 return
-            grey = np.rint(self.editor.depth * 255).astype(np.uint8)
+            grey = np.rint((self.editor.depth if mode == "Depth" else self._selected_ao()) * 255).astype(np.uint8)
             pixels = np.empty_like(self.source)
             pixels[..., :3] = grey[..., None]
             pixels[..., 3] = self.source[..., 3]
@@ -855,7 +879,8 @@ class MainWindow(QMainWindow):
                 if self._preview_normal is None:
                     self._preview_normal = self._selected_normal("OpenGL")
                 lighting_base = self.albedo if self.albedo is not None else self.source
-                pixels = render_lighting(lighting_base, self._preview_normal, *self.light)
+                ao = self._selected_ao() if self.editor is not None else None
+                pixels = render_lighting(lighting_base, self._preview_normal, *self.light, ao)
         self.view.set_pixels(pixels, fit)
         self._update_actions()
 
@@ -889,6 +914,7 @@ class MainWindow(QMainWindow):
             self.editor.move(x, y)
         else:
             self.editor.end()
+        self._preview_ao = None
         self._preview_normal = None
         self._refresh()
 
@@ -899,11 +925,13 @@ class MainWindow(QMainWindow):
 
     def undo(self) -> None:
         if self.editor and self.editor.undo():
+            self._preview_ao = None
             self._preview_normal = None
             self._refresh()
 
     def redo(self) -> None:
         if self.editor and self.editor.redo():
+            self._preview_ao = None
             self._preview_normal = None
             self._refresh()
 
@@ -925,10 +953,13 @@ class MainWindow(QMainWindow):
                 depth_path = export_depth(
                     self.source_path, self.editor.depth, self.source[..., 3], directory
                 )
+                ao_path = export_ao(
+                    self.source_path, self._selected_ao(), self.source[..., 3], directory
+                )
                 project_path = Path(directory) / f"{self.source_path.stem}.ssoul"
                 save_project(project_path, self.source_path, self.editor.depth,
                              20.0, self.convention.currentText(), self.foliage_mask)
-                saved.extend((depth_path.name, project_path.name))
+                saved.extend((depth_path.name, ao_path.name, project_path.name))
             elif self.foliage_mask is not None:
                 project_path = Path(directory) / f"{self.source_path.stem}.ssoul"
                 save_project(project_path, self.source_path, None,

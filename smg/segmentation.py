@@ -1,146 +1,219 @@
-"""Interactive SAM 2.1 image segmentation for foliage selections."""
+"""Text-guided crown segmentation with CLIPSeg."""
 
 import gc
-import io
-import sys
-import urllib.request
-import zipfile
-from pathlib import Path
 
+import cv2
 import numpy as np
+from PIL import Image
 
-from smg.model_paths import MODELS_ROOT
+from smg.model_paths import HUGGINGFACE_HUB_CACHE
 
 
-# Keep the source and checkpoint paired.  SAM 2.1 checkpoints require recent
-# SAM 2 code, so do not silently use an arbitrary globally installed version.
-SAM2_COMMIT = "2b90b9f5ceec907a1c18123530e92e794ad901a4"
-SAM2_SOURCE_ROOT = MODELS_ROOT / f"sam2-{SAM2_COMMIT}"
-SAM2_CHECKPOINT = SAM2_SOURCE_ROOT / "checkpoints" / "sam2.1_hiera_base_plus.pt"
-SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_b+.yaml"
-SAM2_CHECKPOINT_URL = (
-    "https://dl.fbaipublicfiles.com/segment_anything_2/092824/"
-    "sam2.1_hiera_base_plus.pt"
+MODEL_ID = "CIDAS/clipseg-rd64-refined"
+CROWN_PROMPT = "tree canopy"
+DEFAULT_CROWN_THRESHOLD = 0.5
+TREE_CROWN_FRACTION = 0.4
+MODEL_FILES = (
+    "config.json", "preprocessor_config.json", "model.safetensors",
+    "vocab.json", "merges.txt", "tokenizer_config.json", "special_tokens_map.json",
 )
 
 
-def source_root(progress=None) -> Path:
-    """Download the pinned SAM source tree on demand and return its root."""
-    if (SAM2_SOURCE_ROOT / "sam2" / "build_sam.py").is_file():
-        return SAM2_SOURCE_ROOT
-    MODELS_ROOT.mkdir(parents=True, exist_ok=True)
-    url = f"https://github.com/facebookresearch/sam2/archive/{SAM2_COMMIT}.zip"
-    with urllib.request.urlopen(url, timeout=120) as response:
-        data = io.BytesIO()
-        size = response.headers.get("Content-Length")
-        total = int(size) if size and size.isdigit() else None
-        while chunk := response.read(1024 * 1024):
-            data.write(chunk)
-            if progress:
-                progress(data.tell(), total)
-    with zipfile.ZipFile(data) as archive:
-        archive.extractall(MODELS_ROOT)
-    if not (SAM2_SOURCE_ROOT / "sam2" / "build_sam.py").is_file():
-        raise RuntimeError("Не удалось загрузить исходный код SAM 2.1")
-    return SAM2_SOURCE_ROOT
+def crown_mask(scores: np.ndarray, alpha: np.ndarray, threshold: float) -> np.ndarray:
+    """Threshold model probabilities in source coordinates and respect transparency."""
+    scores = np.asarray(scores)
+    if scores.ndim != 2 or scores.shape != alpha.shape:
+        raise ValueError("Размер карты CLIPSeg не соответствует исходному PNG")
+    if not 0 <= threshold <= 1:
+        raise ValueError("Порог CLIPSeg должен быть от 0 до 1")
+    return np.isfinite(scores) & (scores >= threshold) & (alpha > 0)
 
 
-def checkpoint_path(progress=None) -> Path:
-    """Download SAM 2.1 Base+ weights into the pinned source tree."""
-    if SAM2_CHECKPOINT.is_file():
-        return SAM2_CHECKPOINT
-    SAM2_CHECKPOINT.parent.mkdir(parents=True, exist_ok=True)
-    temporary = SAM2_CHECKPOINT.with_suffix(".part")
-    try:
-        with urllib.request.urlopen(SAM2_CHECKPOINT_URL, timeout=120) as response:
-            total_header = response.headers.get("Content-Length")
-            total = int(total_header) if total_header and total_header.isdigit() else None
-            with temporary.open("wb") as file:
-                while chunk := response.read(1024 * 1024):
-                    file.write(chunk)
-                    if progress:
-                        progress(file.tell(), total)
-        temporary.replace(SAM2_CHECKPOINT)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
-    return SAM2_CHECKPOINT
+def _neck_row(alpha: np.ndarray, seed: np.ndarray) -> int:
+    """Find the narrowing below a canopy, where its trunk begins."""
+    rows = np.count_nonzero(alpha, axis=1).astype(np.float32)
+    height = len(rows)
+    smooth = cv2.GaussianBlur(
+        rows[np.newaxis, :], (0, 0), sigmaX=max(1.5, height * 0.01),
+        borderType=cv2.BORDER_REFLECT_101,
+    )[0]
+    seed_rows = np.flatnonzero(np.any(seed, axis=1))
+    alpha_rows = np.flatnonzero(np.any(alpha, axis=1))
+    seed_top, seed_bottom = int(seed_rows[0]), int(seed_rows[-1])
+    alpha_bottom = int(alpha_rows[-1])
+    peak = seed_top + int(np.argmax(smooth[seed_top:seed_bottom + 1]))
+    limit = smooth[peak] * 0.45
+    span = max(3, round(height * 0.015))
+    for y in range(peak + 1, alpha_bottom - span + 2):
+        if np.all(smooth[y:y + span] < limit):
+            return y
+    if alpha_bottom - seed_bottom <= max(5, height * 0.20):
+        return alpha_bottom + 1
+    return min(alpha_bottom + 1, seed_bottom + max(5, round(height * 0.05)))
 
 
-def is_available() -> bool:
-    return (
-        (SAM2_SOURCE_ROOT / "sam2" / "build_sam.py").is_file()
-        and SAM2_CHECKPOINT.is_file()
+def expand_crown_mask(seed_mask: np.ndarray, rgba: np.ndarray) -> np.ndarray:
+    """Grow CLIPSeg's crown to the alpha silhouette without taking the trunk."""
+    if rgba.ndim != 3 or rgba.shape[-1] != 4 or rgba.dtype != np.uint8:
+        raise ValueError("Расширение кроны ожидает RGBA uint8")
+    seed = np.asarray(seed_mask, dtype=bool).copy()
+    if seed.shape != rgba.shape[:2]:
+        raise ValueError("Размер маски кроны не соответствует исходному PNG")
+    opaque = rgba[..., 3] > 0
+    seed &= opaque
+    result = seed.copy()
+    if not np.any(seed):
+        return result
+
+    image = np.rint(
+        rgba[..., :3].astype(np.float32) * (rgba[..., 3:4] / 255)
+        + 127 * (1 - rgba[..., 3:4] / 255)
+    ).astype(np.uint8)
+    count, components, stats, _ = cv2.connectedComponentsWithStats(
+        opaque.astype(np.uint8), connectivity=8,
     )
+    for component_id in range(1, count):
+        x, y, width, height, area = stats[component_id]
+        if area < 32:
+            continue
+        x0, y0 = max(0, x - 1), max(0, y - 1)
+        x1 = min(opaque.shape[1], x + width + 1)
+        y1 = min(opaque.shape[0], y + height + 1)
+        region = np.s_[y0:y1, x0:x1]
+        alpha_part = components[region] == component_id
+        seed_part = seed[region] & alpha_part
+        if np.count_nonzero(seed_part) < 16:
+            continue
 
-
-class SamSession:
-    """A CUDA-backed predictor with one encoded RGBA sprite."""
-
-    def __init__(self, rgba: np.ndarray):
-        if rgba.ndim != 3 or rgba.shape[-1] != 4 or rgba.dtype != np.uint8:
-            raise ValueError("SAM ожидает RGBA uint8")
-        self.rgba = rgba.copy()
-        self._model = None
-        self._predictor = None
-
-    def open(self, progress=None) -> None:
-        import torch
-
-        if not torch.cuda.is_available():
-            raise RuntimeError("Для SAM 2.1 нужна NVIDIA CUDA")
-        root = source_root()
-        checkpoint = checkpoint_path()
-        if str(root) not in sys.path:
-            sys.path.insert(0, str(root))
-        try:
-            from sam2.build_sam import build_sam2
-            from sam2.sam2_image_predictor import SAM2ImagePredictor
-        except ImportError as exc:
-            raise RuntimeError("SAM 2.1 установлен не полностью. Повторите подготовку AI.") from exc
-        if progress:
-            progress("Загрузка SAM 2.1...")
-        try:
-            self._model = build_sam2(SAM2_CONFIG, str(checkpoint), device="cuda")
-            self._predictor = SAM2ImagePredictor(self._model)
-            alpha = self.rgba[..., 3:4].astype(np.float32) / 255
-            rgb = np.rint(self.rgba[..., :3] * alpha + 127 * (1 - alpha)).astype(np.uint8)
-            if progress:
-                progress("SAM 2.1 анализирует изображение...")
-            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-                self._predictor.set_image(np.ascontiguousarray(rgb))
-        except torch.OutOfMemoryError as exc:
-            self.close()
-            raise RuntimeError("Недостаточно VRAM для SAM 2.1. Закройте другие GPU-приложения.") from exc
-
-    def predict(self, points: list[tuple[int, int]], labels: list[int]) -> np.ndarray:
-        if len(points) != len(labels) or not points or not any(labels):
-            raise ValueError("Для выделения нужен хотя бы один добавляющий клик")
-        if self._predictor is None:
-            raise RuntimeError("SAM 2.1 ещё не готова")
-        import torch
-        coordinates = np.asarray(points, np.float32)
-        prompt_labels = np.asarray(labels, np.int32)
-        try:
-            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-                masks, _scores, _logits = self._predictor.predict(
-                    point_coords=coordinates, point_labels=prompt_labels,
-                    multimask_output=False,
+        row = np.arange(alpha_part.shape[0])[:, None]
+        cutoff = _neck_row(alpha_part, seed_part)
+        alpha_bottom = int(np.flatnonzero(np.any(alpha_part, axis=1))[-1])
+        if cutoff > alpha_bottom:
+            seed_rows = np.flatnonzero(np.any(seed_part, axis=1))
+            tail = alpha_part & (row > seed_rows[-1])
+            if np.any(tail):
+                upper = seed_part & (row < seed_rows[0] + 0.7 * len(seed_rows))
+                lab = cv2.cvtColor(image[region], cv2.COLOR_RGB2LAB)
+                separation = np.linalg.norm(
+                    np.median(lab[upper], axis=0) - np.median(lab[tail], axis=0)
                 )
-        except torch.OutOfMemoryError as exc:
-            raise RuntimeError("Недостаточно VRAM для уточнения маски SAM 2.1.") from exc
-        mask = np.asarray(masks[0], dtype=bool)
-        if mask.shape != self.rgba.shape[:2]:
-            raise RuntimeError("SAM 2.1 вернула маску неверного размера")
-        return mask & (self.rgba[..., 3] > 0)
+                if separation > 25:
+                    cutoff = min(alpha_bottom, int(seed_rows[-1]) + 3)
+            if cutoff > alpha_bottom:
+                result[region] |= alpha_part
+                continue
 
-    def close(self) -> None:
-        self._predictor = None
-        self._model = None
-        gc.collect()
+        result[region] &= ~(alpha_part & (row >= cutoff))
+        labels = np.full(alpha_part.shape, cv2.GC_BGD, np.uint8)
+        labels[alpha_part & (row < cutoff)] = cv2.GC_PR_FGD
+        labels[alpha_part & (row >= cutoff)] = cv2.GC_PR_BGD
+        trunk_margin = max(3, round(height * 0.025))
+        labels[alpha_part & (row >= cutoff + trunk_margin)] = cv2.GC_BGD
+        core = cv2.erode(
+            seed_part.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        ) > 0
+        labels[core & (row < cutoff - 2)] = cv2.GC_FGD
+        if not np.any(labels == cv2.GC_FGD):
+            continue
         try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except ImportError:
-            pass
+            cv2.grabCut(
+                image[region], labels, None,
+                np.zeros((1, 65), np.float64), np.zeros((1, 65), np.float64),
+                3, cv2.GC_INIT_WITH_MASK,
+            )
+            grown = np.isin(labels, (cv2.GC_FGD, cv2.GC_PR_FGD))
+        except cv2.error:
+            grown = cv2.dilate(
+                seed_part.astype(np.uint8),
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)),
+            ) > 0
+        grown = (grown | seed_part) & alpha_part & (row < cutoff)
+
+        # A small contour band includes antialiased leaf tips without extending
+        # through the interior connection between the crown and trunk.
+        near_crown = cv2.dilate(
+            grown.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)),
+        ) > 0
+        near_alpha_edge = cv2.distanceTransform(
+            np.pad(alpha_part.astype(np.uint8), 1), cv2.DIST_L2, 3,
+        )[1:-1, 1:-1] <= 5
+        grown |= near_crown & near_alpha_edge & alpha_part & (row < cutoff)
+        result[region] |= grown
+    return result & opaque
+
+
+def tree_crown_mask(scores: np.ndarray, rgba: np.ndarray) -> np.ndarray | None:
+    """Return the expanded crown only when it covers over 40% of opaque pixels."""
+    if rgba.ndim != 3 or rgba.shape[-1] != 4 or rgba.dtype != np.uint8:
+        raise ValueError("Определение дерева ожидает RGBA uint8")
+    opaque_count = np.count_nonzero(rgba[..., 3])
+    if opaque_count == 0:
+        return None
+    seed = crown_mask(scores, rgba[..., 3], DEFAULT_CROWN_THRESHOLD)
+    mask = expand_crown_mask(seed, rgba)
+    return mask if np.count_nonzero(mask) > TREE_CROWN_FRACTION * opaque_count else None
+
+
+def detect_tree_crown(rgba: np.ndarray, progress=None) -> np.ndarray | None:
+    """Use CLIPSeg to classify a sprite and return its crown if it is a tree."""
+    if rgba.ndim != 3 or rgba.shape[-1] != 4 or rgba.dtype != np.uint8:
+        raise ValueError("Определение дерева ожидает RGBA uint8")
+    if not np.any(rgba[..., 3]):
+        return None
+    mask = tree_crown_mask(predict_crown_scores(rgba, progress), rgba)
+    if progress:
+        progress("Дерево: крона найдена" if mask is not None else "Крона меньше 40%: обычная Normal")
+    return mask
+
+
+def predict_crown_scores(rgba: np.ndarray, progress=None) -> np.ndarray:
+    """Return CLIPSeg probabilities at the original sprite resolution."""
+    if rgba.ndim != 3 or rgba.shape[-1] != 4 or rgba.dtype != np.uint8:
+        raise ValueError("CLIPSeg ожидает RGBA uint8")
+
+    import torch
+    import torch.nn.functional as F
+    from transformers import CLIPSegForImageSegmentation, CLIPSegProcessor
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("Для CLIPSeg нужна NVIDIA CUDA")
+
+    model = None
+    try:
+        if progress:
+            progress("Загрузка CLIPSeg...")
+        processor = CLIPSegProcessor.from_pretrained(
+            MODEL_ID, cache_dir=HUGGINGFACE_HUB_CACHE, local_files_only=True,
+            use_fast=False,
+        )
+        model = CLIPSegForImageSegmentation.from_pretrained(
+            MODEL_ID, cache_dir=HUGGINGFACE_HUB_CACHE, local_files_only=True,
+            use_safetensors=True,
+        ).to("cuda").eval()
+
+        alpha = rgba[..., 3:4].astype(np.float32) / 255
+        rgb = np.rint(rgba[..., :3] * alpha + 127 * (1 - alpha)).astype(np.uint8)
+        inputs = processor(
+            text=[CROWN_PROMPT], images=[Image.fromarray(rgb)],
+            return_tensors="pt",
+        ).to("cuda")
+        if progress:
+            progress("CLIPSeg определяет крону...")
+        with torch.inference_mode():
+            logits = model(**inputs).logits.unsqueeze(1)
+            logits = F.interpolate(
+                logits.float(), size=rgba.shape[:2], mode="bilinear",
+                align_corners=False,
+            )
+            scores = logits.sigmoid()[0, 0].cpu().numpy().astype(np.float32)
+        if scores.shape != rgba.shape[:2]:
+            raise RuntimeError("CLIPSeg вернула карту неверного размера")
+        return scores
+    except torch.OutOfMemoryError as exc:
+        raise RuntimeError("Недостаточно VRAM для CLIPSeg. Закройте другие GPU-приложения.") from exc
+    finally:
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()

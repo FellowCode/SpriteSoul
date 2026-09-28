@@ -17,7 +17,6 @@ def image_from_array(pixels: np.ndarray) -> QImage:
 class ImageView(QGraphicsView):
     brush_event = Signal(str, int, int)
     light_changed = Signal(float, float)
-    selection_event = Signal(int, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -29,7 +28,6 @@ class ImageView(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.mode = "Source"
         self.tool = "Pan"
-        self.selection_enabled = False
         self._dragging = False
         self._has_image = False
         self.set_dark_theme(False)
@@ -73,9 +71,6 @@ class ImageView(QGraphicsView):
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton and self._has_image:
-            if self.selection_enabled:
-                self.selection_event.emit(*self._position(event))
-                return
             if self.mode == "Depth" and self.tool != "Pan":
                 self._dragging = True
                 self.brush_event.emit("begin", *self._position(event))

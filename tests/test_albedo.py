@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 
 from smg.albedo import prepare_intrinsic_input, reconstruct_albedo
-from smg.albedo_ai import DEFAULT_INTRINSIC_ROOT, _sprite_labels
+from smg.albedo_ai import DEFAULT_INTRINSIC_ROOT, _enable_low_vram, _sprite_labels
 from smg.model_paths import (
     HUGGINGFACE_HUB_CACHE,
     HUGGINGFACE_XET_CACHE,
@@ -60,6 +60,27 @@ def test_intrinsic_default_is_inside_project():
     assert DEFAULT_INTRINSIC_ROOT == (
         Path(__file__).resolve().parents[1] / "models" / "IntrinsicAnything"
     )
+
+
+def test_intrinsic_low_vram_patch_is_repeatable(tmp_path):
+    models = tmp_path / "models"
+    models.mkdir()
+    matfusion = models / "matfusion.py"
+    inference = tmp_path / "inference.py"
+    matfusion.write_text("    model.eval().to(device)\n", encoding="utf-8")
+    inference.write_text(
+        "    model.generation(dps_scale=args.guidance, uc_score=1, \n"
+        "                     ddim_steps=args.ddim, batch_size=args.batch_size, n_samples=1)\n",
+        encoding="utf-8",
+    )
+
+    _enable_low_vram(tmp_path)
+    patched = (matfusion.read_text(encoding="utf-8"), inference.read_text(encoding="utf-8"))
+    _enable_low_vram(tmp_path)
+
+    assert patched == (matfusion.read_text(encoding="utf-8"), inference.read_text(encoding="utf-8"))
+    assert "model.eval().half().to(device)" in patched[0]
+    assert 'with torch.autocast("cuda", dtype=torch.float16):' in patched[1]
 
 
 def test_all_model_storage_is_inside_project():

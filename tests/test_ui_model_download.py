@@ -54,11 +54,14 @@ def test_generate_menu_groups_all_map_actions():
     window = main_window.MainWindow()
     assert window.generate_menu.title() == "Генерировать"
     assert [action.text() for action in window.generate_menu.actions()] == [
-        "Карта глубины", "Карта нормалей", "Albedo", "Все карты",
+        "Карта глубины", "Карта AO", "Карта нормалей", "Albedo", "Все карты",
     ]
     assert not hasattr(window, "normal_source")
     assert window.ai_smoothing.value() == 1.5
     assert window.ai_details.value() == 0.35
+    assert window.select_foliage_action.text() == "Определить крону"
+    assert window.mode.itemText(window.mode.count() - 1) == "Маска кроны"
+    assert "SAM" not in " ".join(action.text() for action in window.findChildren(main_window.QAction))
     window.close()
     app.processEvents()
 
@@ -91,7 +94,7 @@ def test_lighting_preview_prefers_albedo_and_falls_back_to_source(monkeypatch):
     window.mode.blockSignals(False)
     bases = []
 
-    def fake_render(base, normal, light_x, light_y):
+    def fake_render(base, normal, light_x, light_y, ao=None):
         bases.append(base)
         return base
 
@@ -106,25 +109,175 @@ def test_lighting_preview_prefers_albedo_and_falls_back_to_source(monkeypatch):
     app.processEvents()
 
 
-def test_foliage_selection_is_confirmed_or_cancelled_without_overwriting_saved_mask():
+def test_crown_detection_threshold_confirm_cancel_and_redetect():
     app = QApplication.instance() or QApplication([])
     window = main_window.MainWindow()
     window.source = np.full((4, 5, 4), 255, np.uint8)
     saved = np.zeros((4, 5), bool)
     saved[0, 0] = True
-    candidate = np.zeros((4, 5), bool)
-    candidate[2, 3] = True
     window.foliage_mask = saved.copy()
     window._selection_active = True
-    window._selection_ready = True
-    window._selection_mask = candidate
+    scores = np.zeros((4, 5), np.float32)
+    scores[2, 3] = 0.7
+    scores[1, 4] = 0.9
+    window.source[1, 4, 3] = 0
+    window._selection_scores_generated(scores)
+    assert not window.open_action.isEnabled()
+    assert not window.generate_menu.menuAction().isEnabled()
+    assert window._selection_mask[2, 3]
+    assert not window._selection_mask[1, 4]
+    window.selection_threshold.setValue(80)
+    assert not window._selection_mask.any()
+    assert not window.selection_done.isEnabled()
+    window.selection_threshold.setValue(50)
     window.finish_foliage_selection()
-    assert np.array_equal(window.foliage_mask, candidate)
+    candidate = window.foliage_mask.copy()
+    assert candidate[2, 3] and candidate.sum() == 1
+    assert window.open_action.isEnabled()
 
     window._selection_active = True
-    window._selection_ready = True
-    window._selection_mask = saved
+    window._selection_scores_generated(np.full((4, 5), 0.95, np.float32))
     window.cancel_foliage_selection()
     assert np.array_equal(window.foliage_mask, candidate)
     window.close()
     app.processEvents()
+
+
+def test_crown_normal_updates_before_and_after_ai_generation():
+    app = QApplication.instance() or QApplication([])
+    window = main_window.MainWindow()
+    window.source = np.full((56, 64, 4), 120, np.uint8)
+    window.source[..., 3] = 255
+    front = np.zeros((56, 64, 3), np.float32)
+    front[..., 2] = 1
+    mask = np.zeros((56, 64), bool)
+    mask[8:48, 10:54] = True
+    window.source[..., 3] = np.where(mask, 255, 0).astype(np.uint8)
+
+    window.foliage_mask = mask
+    window._ai_generated(front)
+    assert window.mode.currentText() == "Normal"
+    early = window._selected_normal("OpenGL")
+    assert early[28, 17, 0] < 100 < early[28, 47, 0]
+
+    window.foliage_mask = None
+    window._refresh()
+    flat = window._selected_normal("OpenGL")
+    window._selection_active = True
+    window._selection_scores_generated(mask.astype(np.float32))
+    window.finish_foliage_selection()
+    late = window._selected_normal("OpenGL")
+    assert window.mode.currentText() == "Normal"
+    assert np.array_equal(late, early)
+    assert not np.array_equal(late, flat)
+    window.close()
+    app.processEvents()
+
+
+def test_detected_crown_preview_and_saved_mask_reach_alpha_edges():
+    app = QApplication.instance() or QApplication([])
+    window = main_window.MainWindow()
+    window.source = np.zeros((50, 60, 4), np.uint8)
+    window.source[5:45, 8:52] = (40, 120, 50, 255)
+    scores = np.zeros((50, 60), np.float32)
+    scores[12:38, 16:44] = 0.9
+    window._selection_active = True
+    window._selection_scores_generated(scores)
+    assert np.array_equal(window._selection_mask, window.source[..., 3] > 0)
+    window.finish_foliage_selection()
+    assert np.array_equal(window.foliage_mask, window.source[..., 3] > 0)
+    window.close()
+    app.processEvents()
+
+
+def test_normal_workers_detect_crown_only_without_saved_mask(monkeypatch):
+    prepared = []
+    detected = []
+    monkeypatch.setattr(main_window, "prepare_environment",
+                        lambda models, progress, events: prepared.append(tuple(models)))
+
+    def fake_detect(rgba, progress):
+        detected.append(True)
+        return np.ones(rgba.shape[:2], bool)
+
+    monkeypatch.setattr(main_window, "detect_tree_crown", fake_detect)
+
+    class FlatAI:
+        def __init__(self, fov):
+            pass
+
+        def generate(self, rgba, progress):
+            vectors = np.zeros((*rgba.shape[:2], 3), np.float32)
+            vectors[..., 2] = 1
+            return vectors
+
+    monkeypatch.setattr(main_window, "DSINENormalModel", FlatAI)
+    rgba = np.full((4, 5, 4), 255, np.uint8)
+    worker = main_window.GenerateNormalThread(rgba, 60)
+    results = []
+    worker.generated.connect(results.append)
+    worker.run()
+    assert prepared == [("ai", "clipseg")]
+    assert len(detected) == 1
+    assert results[0][1].all()
+
+    prepared.clear()
+    saved = np.zeros(rgba.shape[:2], bool)
+    saved[1, 2] = True
+    worker = main_window.GenerateNormalThread(rgba, 60, saved)
+    worker.generated.connect(results.append)
+    worker.run()
+    assert prepared == [("ai",)]
+    assert len(detected) == 1
+    assert np.array_equal(results[-1][1], saved)
+
+
+def test_auto_crown_is_applied_when_normal_arrives():
+    app = QApplication.instance() or QApplication([])
+    window = main_window.MainWindow()
+    window.source = np.full((56, 64, 4), 120, np.uint8)
+    window.source[..., 3] = 255
+    front = np.zeros((56, 64, 3), np.float32)
+    front[..., 2] = 1
+    mask = np.zeros((56, 64), bool)
+    mask[8:48, 10:54] = True
+    window._ai_generated((front, mask))
+    assert np.array_equal(window.foliage_mask, mask)
+    curved = window._selected_normal("OpenGL")
+    assert curved[28, 17, 0] < 100 < curved[28, 47, 0]
+    window.foliage_mask = None
+    window._ai_generated((front, None))
+    assert window.foliage_mask is None
+    assert window._selected_normal("OpenGL")[28, 17, 0] == 128
+    window.close()
+    app.processEvents()
+
+
+def test_generate_all_worker_detects_crown(monkeypatch):
+    prepared = []
+    monkeypatch.setattr(main_window, "prepare_environment",
+                        lambda models, progress, events: prepared.append(tuple(models)))
+    monkeypatch.setattr(main_window, "DepthModel", lambda: object())
+    monkeypatch.setattr(main_window, "generate_depth",
+                        lambda rgba, model, progress: np.zeros(rgba.shape[:2], np.float32))
+    monkeypatch.setattr(main_window, "generate_albedo", lambda rgba, progress: rgba)
+    monkeypatch.setattr(main_window, "detect_tree_crown",
+                        lambda rgba, progress: np.ones(rgba.shape[:2], bool))
+
+    class FlatAI:
+        def __init__(self, fov):
+            pass
+
+        def generate(self, rgba, progress):
+            return np.zeros((*rgba.shape[:2], 3), np.float32)
+
+    monkeypatch.setattr(main_window, "DSINENormalModel", FlatAI)
+    worker = main_window.GenerateAllThread(np.full((4, 5, 4), 255, np.uint8), 60)
+    results = []
+    failures = []
+    worker.normal_generated.connect(results.append)
+    worker.failed.connect(failures.append)
+    worker.run()
+    assert failures == []
+    assert prepared == [("depth", "ai", "albedo", "clipseg")]
+    assert results[0][1].all()

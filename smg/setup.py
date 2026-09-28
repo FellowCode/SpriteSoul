@@ -17,10 +17,7 @@ from pathlib import Path
 from smg.depth.inference import MODEL_ID
 from smg.model_paths import HUGGINGFACE_HUB_CACHE, INTRINSIC_ROOT, MODELS_ROOT
 from smg.normal_ai import CHECKPOINT_REPO, DSINE_SOURCE_ROOT, _source_root
-from smg.segmentation import (
-    SAM2_CHECKPOINT, SAM2_SOURCE_ROOT, checkpoint_path as _sam_checkpoint_path,
-    source_root as _sam_source_root,
-)
+from smg.segmentation import MODEL_FILES as CLIPSEG_FILES, MODEL_ID as CLIPSEG_MODEL_ID
 
 
 Progress = Callable[[str], None]
@@ -33,7 +30,7 @@ MODEL_LABELS = {
     "depth": "Depth Anything V2",
     "ai": "DSINE",
     "albedo": "IntrinsicAnything (Albedo)",
-    "sam": "SAM 2.1 Base+ (выделение листвы)",
+    "clipseg": "CLIPSeg (определение кроны)",
 }
 _PIP_BYTES = re.compile(r"(?P<current>\d+(?:\.\d+)?)/(?P<total>\d+(?:\.\d+)?) (?P<unit>kB|MB|GB)")
 _PIP_UNITS = {"kB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3}
@@ -73,11 +70,8 @@ def model_available(model: str) -> bool:
             and (INTRINSIC_ROOT / "weights/albedo/configs/albedo_project.yaml").is_file()
             and (INTRINSIC_ROOT / "weights/albedo/checkpoints/last.ckpt").is_file()
         )
-    if model == "sam":
-        return (
-            (SAM2_SOURCE_ROOT / "sam2" / "build_sam.py").is_file()
-            and SAM2_CHECKPOINT.is_file()
-        )
+    if model == "clipseg":
+        return all(_cached_model_file(CLIPSEG_MODEL_ID, name) for name in CLIPSEG_FILES)
     raise ValueError(f"Неизвестная модель: {model}")
 
 
@@ -207,66 +201,6 @@ def _pip_install(command: list[str], progress: Progress, label: str,
                 _emit(events, "pip_install", "log", line, component=component)
     if process.wait() != 0:
         raise RuntimeError(f"{label} не удалась: " + " | ".join(tail))
-
-
-def _prepare_sam(progress: Progress, events: Events | None) -> None:
-    """Fetch SAM 2.1 and install only its small Python runtime dependencies."""
-    report = progress
-    report("SAM 2.1: исходный код")
-    _emit(events, "model_download", "start", "SAM 2.1: исходный код", model="sam",
-          file="source", current=0, total=2, unit="files")
-
-    def source_progress(current: int, total: int | None) -> None:
-        details = {"model": "sam", "file": "source", "current": current, "unit": "bytes"}
-        if total is not None:
-            details["total"] = total
-        _emit(events, "model_download", "update", "Загрузка кода SAM 2.1", **details)
-
-    root = _sam_source_root(source_progress)
-    _emit(events, "model_download", "done", "SAM 2.1: исходный код", model="sam",
-          file="source", current=1, total=2, unit="files")
-    report("SAM 2.1: веса Base+")
-    _emit(events, "model_download", "start", "SAM 2.1: веса Base+", model="sam",
-          file="sam2.1_hiera_base_plus.pt", current=1, total=2, unit="files")
-
-    def checkpoint_progress(current: int, total: int | None) -> None:
-        details = {"model": "sam", "file": "sam2.1_hiera_base_plus.pt", "current": current,
-                   "unit": "bytes"}
-        if total is not None:
-            details["total"] = total
-        _emit(events, "model_download", "update", "Загрузка весов SAM 2.1", **details)
-
-    cached = SAM2_CHECKPOINT.is_file()
-    _sam_checkpoint_path(checkpoint_progress)
-    _emit(events, "model_download", "cached" if cached else "done", "SAM 2.1: веса Base+",
-          model="sam", file="sam2.1_hiera_base_plus.pt", current=2, total=2, unit="files")
-
-    # SAM's legacy setuptools build invokes ``bdist_wheel`` even when CUDA is
-    # disabled.  ``--no-build-isolation`` means pip will not supply wheel in a
-    # temporary build environment, so make it an explicit runtime prerequisite.
-    required = ("torchvision", "hydra", "iopath", "wheel")
-    if any(importlib.util.find_spec(name) is None for name in required):
-        _pip_install(
-            [sys.executable, "-m", "pip", "install", "--progress-bar", "on",
-             "torchvision==0.21.0", "hydra-core>=1.3.2", "iopath>=0.1.10", "wheel>=0.45"],
-            report, "Установка зависимостей SAM 2.1", events, "sam-runtime",
-        )
-    # SAM's optional extension requires a local CUDA Toolkit, which Sprite Soul
-    # deliberately does not require.  Image prediction works without it.
-    if importlib.util.find_spec("sam2") is None:
-        old_value = os.environ.get("SAM2_BUILD_CUDA")
-        os.environ["SAM2_BUILD_CUDA"] = "0"
-        try:
-            _pip_install(
-                [sys.executable, "-m", "pip", "install", "--no-deps", "--no-build-isolation",
-                 "--progress-bar", "on", "-e", str(root)],
-                report, "Установка SAM 2.1", events, "sam",
-            )
-        finally:
-            if old_value is None:
-                os.environ.pop("SAM2_BUILD_CUDA", None)
-            else:
-                os.environ["SAM2_BUILD_CUDA"] = old_value
 
 
 def _replace_intrinsic_source(path: Path, old: str, new: str, count: int = 1) -> None:
@@ -455,9 +389,9 @@ def prepare_environment(models: Iterable[str] = ("depth", "ai"), progress: Progr
     """Install CUDA PyTorch when needed, then cache exactly the files inference uses."""
     report = progress or (lambda _message: None)
     selected = set(models)
-    if selected - {"depth", "ai", "albedo", "sam"}:
+    if selected - {"depth", "ai", "albedo", "clipseg"}:
         raise ValueError("Неизвестная модель для загрузки")
-    if install_cuda and selected & {"depth", "ai", "sam"}:
+    if install_cuda and selected & {"depth", "ai", "clipseg"}:
         ensure_cuda(report, events)
     if "depth" in selected:
         files = ("config.json", "preprocessor_config.json", "model.safetensors")
@@ -494,7 +428,15 @@ def prepare_environment(models: Iterable[str] = ("depth", "ai"), progress: Progr
               model="ai", file="dsine.pt", current=2, total=2, unit="files")
     if "albedo" in selected:
         _prepare_intrinsic(report, events)
-    if "sam" in selected:
-        _prepare_sam(report, events)
+    if "clipseg" in selected:
+        for index, filename in enumerate(CLIPSEG_FILES, 1):
+            message = f"CLIPSeg: {filename}"
+            report(message)
+            _emit(events, "model_download", "start", message, model="clipseg",
+                  file=filename, current=index - 1, total=len(CLIPSEG_FILES), unit="files")
+            cached = _model_file(CLIPSEG_MODEL_ID, filename)
+            _emit(events, "model_download", "cached" if cached else "done", message,
+                  model="clipseg", file=filename, current=index,
+                  total=len(CLIPSEG_FILES), unit="files")
     report("Подготовка завершена")
     _emit(events, "setup", "done", "Подготовка завершена")

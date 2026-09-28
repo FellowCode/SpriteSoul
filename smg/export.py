@@ -50,6 +50,19 @@ def export_albedo(source_path: str | Path, albedo: np.ndarray,
     return albedo_path
 
 
+def export_ao(source_path: str | Path, ao: np.ndarray, alpha: np.ndarray,
+              directory: str | Path) -> Path:
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    ao_path = directory / f"{Path(source_path).stem}_ao.png"
+    grey = np.rint(np.clip(ao, 0, 1) * 255).astype(np.uint8)
+    rgba = np.empty((*grey.shape, 4), np.uint8)
+    rgba[..., :3] = grey[..., None]
+    rgba[..., 3] = alpha
+    Image.fromarray(rgba).save(ao_path)
+    return ao_path
+
+
 def _validated_foliage_mask(foliage_mask: np.ndarray | None,
                             shape: tuple[int, int] | None = None) -> np.ndarray | None:
     if foliage_mask is None:
