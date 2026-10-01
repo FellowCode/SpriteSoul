@@ -83,12 +83,20 @@ def test_setup_cli_accepts_clipseg(monkeypatch):
     assert calls == [(("clipseg",), False)]
 
 
-def test_setup_cli_all_includes_clipseg(monkeypatch):
+def test_setup_cli_all_includes_every_model(monkeypatch):
     calls = []
     monkeypatch.setattr(setup, "prepare_environment", lambda models, progress, install_cuda, events=None:
                         calls.append(models))
     assert main(["setup", "--models", "all", "--skip-cuda"]) == 0
-    assert calls == [("depth", "ai", "clipseg")]
+    assert calls == [("depth", "ai", "clipseg", "albedo")]
+
+
+def test_setup_cli_accepts_albedo(monkeypatch):
+    calls = []
+    monkeypatch.setattr(setup, "prepare_environment", lambda models, progress, install_cuda, events=None:
+                        calls.append(models))
+    assert main(["setup", "--models", "albedo", "--skip-cuda"]) == 0
+    assert calls == [("albedo",)]
 
 
 def test_clipseg_availability_checks_every_required_file(monkeypatch):

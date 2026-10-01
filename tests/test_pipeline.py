@@ -2,7 +2,6 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from smg.editor import DepthEditor
 from smg.depth.processing import normalize_depth
 from smg.export import export_maps, load_project, save_project
 from smg.pipeline import generate_normal, open_png
@@ -29,17 +28,6 @@ def test_export_and_project(tmp_path):
     assert loaded_path == path
     assert np.array_equal(loaded_depth, depth)
     assert strength == 3.5 and convention == "DirectX"
-
-
-def test_brush_undo_redo():
-    alpha = np.full((40, 40), 255, np.uint8)
-    editor = DepthEditor(np.full((40, 40), 0.5, np.float32), alpha)
-    editor.begin("Raise", 5, 0.1, 20, 20)
-    editor.move(23, 20)
-    editor.end()
-    assert editor.depth[20, 20] > 0.5
-    assert editor.undo() and np.allclose(editor.depth, 0.5)
-    assert editor.redo() and editor.depth[20, 20] > 0.5
 
 
 def test_normalized_depth_is_float32():

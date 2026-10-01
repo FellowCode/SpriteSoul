@@ -36,7 +36,7 @@ def test_export_ao_preserves_alpha(tmp_path):
     assert rgba[0, 0, 0] == 255 and rgba[1, 0, 0] == 0
 
 
-def test_ui_ao_uses_edited_depth_without_running_model():
+def test_ui_ao_uses_processed_depth_without_running_model():
     from PySide6.QtWidgets import QApplication
     from smg.ui.main_window import MainWindow
 
@@ -49,10 +49,7 @@ def test_ui_ao_uses_edited_depth_without_running_model():
     window.generate_ao()
     assert window.mode.currentText() == "AO"
     before = window._selected_ao().copy()
-    window.tool.setCurrentText("Raise")
-    window.radius.setValue(3)
-    window._brush_event("begin", 16, 16)
-    window._brush_event("end", 16, 16)
+    window.smooth.setValue(30)
     after = window._selected_ao()
     assert not np.array_equal(after, before)
     window.close()

@@ -84,6 +84,7 @@ def test_tree_requires_more_than_40_percent_of_opaque_pixels(monkeypatch):
     scores.flat[4] = 0.9
     mask = tree_crown_mask(scores, rgba)
     assert mask is not None and mask.sum() == 5
+    assert tree_crown_mask(scores, rgba, threshold=0.95) is None
     scores.flat[4] = 0
     scores.flat[3] = 0
     assert tree_crown_mask(scores, rgba) is None

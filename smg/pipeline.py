@@ -21,8 +21,15 @@ def open_depth_png(path: str | Path, shape: tuple[int, int]) -> np.ndarray:
     if not data.startswith(b"\x89PNG\r\n\x1a\n"):
         raise ValueError("Карта глубины должна быть PNG-файлом")
     pixels = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
-    if pixels is None or pixels.shape[:2] != shape:
-        raise ValueError("Размер карты глубины не соответствует исходному PNG")
+    if pixels is None:
+        raise ValueError(f"Не удалось прочитать карту глубины: {path}")
+    if pixels.shape[:2] != shape:
+        height, width = pixels.shape[:2]
+        expected_height, expected_width = shape
+        raise ValueError(
+            f"Размер карты глубины {path}: {width}x{height}; "
+            f"размер спрайта: {expected_width}x{expected_height}"
+        )
     if pixels.dtype not in (np.uint8, np.uint16):
         raise ValueError("Карта глубины должна быть 8- или 16-битной")
     if pixels.ndim == 3:

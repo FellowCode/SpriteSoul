@@ -69,9 +69,9 @@ def _add_generate_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-o", "--output", default=Path("generated"), type=Path, metavar="DIR",
                         help="каталог для экспортируемых карт (по умолчанию: ./generated)")
     parser.add_argument("--maps", choices=("both", "depth", "normal", "albedo", "ao", "all"), default="both",
-                        help="какие карты записать (по умолчанию: both; all добавляет AO и Albedo)")
-    parser.add_argument("--depth-map", type=Path, metavar="PNG",
-                        help="готовая серая карта глубины для одного исходного PNG; пропускает Depth AI")
+                        help="какие карты записать (по умолчанию: Depth и Normal; all — все четыре)")
+    parser.add_argument("--depth-map", type=Path, metavar="PNG|DIR",
+                        help="готовая Depth: PNG для одного входа или каталог с <имя>_depth.png для пакета")
     parser.add_argument("--normal-source", choices=("ai",), default="ai",
                         help="источник нормалей: только AI/DSINE")
     parser.add_argument("--convention", choices=("opengl", "directx"), default="opengl",
@@ -97,8 +97,18 @@ def _add_generate_args(parser: argparse.ArgumentParser) -> None:
                         help="инвертировать X у AI нормалей (по умолчанию: включено)")
     parser.add_argument("--invert-ai-y", action=argparse.BooleanOptionalAction, default=True,
                         help="инвертировать Y у AI нормалей (по умолчанию: включено)")
-    parser.add_argument("--save-project", action="store_true",
-                        help="сохранить итоговую глубину в .ssoul для дальнейшего редактирования")
+    parser.add_argument("--crown-mode", choices=("auto", "off"), default="auto",
+                        help="коррекция нормалей кроны: автоматически или выключена (по умолчанию: auto)")
+    parser.add_argument("--crown-threshold", type=_bounded_float(0, 1), default=0.5,
+                        help="порог CLIPSeg для кроны, 0–1 (по умолчанию: 0.5)")
+    parser.add_argument("--albedo-strength", type=_bounded_float(0, 4), default=1.0,
+                        help="сила коррекции Albedo, 0–4 (по умолчанию: 1)")
+    parser.add_argument("--albedo-smooth", type=_bounded_float(0, 16), default=2.0,
+                        help="сглаживание освещения Albedo, sigma 0–16 (по умолчанию: 2)")
+    parser.add_argument("--albedo-shadows", type=_bounded_float(0, 4), default=1.0,
+                        help="сила коррекции теней Albedo, 0–4 (по умолчанию: 1)")
+    parser.add_argument("--save-project", action=argparse.BooleanOptionalAction, default=False,
+                        help="сохранить итоговую глубину и маску кроны в .ssoul (по умолчанию: только экспорт PNG)")
     parser.add_argument("--albedo-debug", type=Path, metavar="DIR",
                         help="сохранить промежуточные карты Albedo в DIR")
     parser.add_argument("--overwrite", action="store_true", help="перезаписать существующие выходные файлы")
@@ -108,11 +118,11 @@ def _add_generate_args(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sprite-soul",
-        description="Генерация карт глубины и нормалей; установка CUDA и моделей без UI.",
+        description="Генерация Depth, Normal, Albedo и AO; установка моделей без UI.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=("Примеры:\n"
                 "  sprite-soul setup --models all\n"
-                "  sprite-soul generate sprite.png\n"
+                "  sprite-soul generate sprite.png --maps all -o exported --no-save-project\n"
                 "  sprite-soul generate sprite.png --progress json\n\n"
                 "Подробности: sprite-soul generate --help; sprite-soul setup --help."),
     )
@@ -120,8 +130,9 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")
     generate = commands.add_parser(
         "generate", help="создать карты из PNG или проекта .ssoul",
-        description="Сгенерировать Depth и Normal; при необходимости подготовить AI.",
-        epilog="Пример: sprite-soul generate sprite.png --maps normal --ai-smoothing 1.5",
+        description="Сгенерировать и сразу экспортировать выбранные карты в PNG одной командой. "
+                    "Проект .ssoul по умолчанию не сохраняется; при необходимости модели готовятся автоматически.",
+        epilog="Пример: sprite-soul generate sprite.png --maps all -o exported --no-save-project",
     )
     _add_generate_args(generate)
     setup = commands.add_parser(
@@ -129,7 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Установить CUDA-сборку PyTorch и заранее скачать модели.",
         epilog="Пример: sprite-soul setup --models depth --progress json",
     )
-    setup.add_argument("--models", choices=("all", "depth", "ai", "clipseg", "none"), default="all",
+    setup.add_argument("--models", choices=("all", "depth", "ai", "clipseg", "albedo", "none"), default="all",
                        help="какие модели скачать (по умолчанию: all)")
     setup.add_argument("--skip-cuda", action="store_true",
                        help="скачать модели без проверки и установки CUDA")
@@ -140,7 +151,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _setup_command(args: argparse.Namespace, reporter: Reporter) -> int:
     from smg.setup import prepare_environment
 
-    models = ("depth", "ai", "clipseg") if args.models == "all" else (() if args.models == "none" else (args.models,))
+    models = ("depth", "ai", "clipseg", "albedo") if args.models == "all" else (() if args.models == "none" else (args.models,))
     try:
         prepare_environment(models, reporter.text, install_cuda=not args.skip_cuda,
                             events=reporter.emit)
@@ -176,9 +187,12 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
     else:
         source_path = path
         rgba = open_png(path)
-        base_depth = open_depth_png(args.depth_map, rgba.shape[:2]) if args.depth_map else None
+        base_depth = None
         foliage_mask = None
-
+    if args.depth_map:
+        depth_path = (args.depth_map / f"{source_path.stem}_depth.png"
+                      if args.depth_map.is_dir() else args.depth_map)
+        base_depth = open_depth_png(depth_path, rgba.shape[:2])
     output = args.output
     stem = source_path.stem
     wants_depth = args.maps in ("both", "depth", "all")
@@ -213,8 +227,10 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
         models.append("depth")
     if wants_normal:
         models.append("ai")
-        if foliage_mask is None:
+        if args.crown_mode == "auto" and foliage_mask is None:
             models.append("clipseg")
+    if wants_albedo:
+        models.append("albedo")
     if models:
         prepare_environment(models, reporter.text, events=reporter.emit)
 
@@ -229,8 +245,11 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
 
     normal = None
     if wants_normal:
-        if foliage_mask is None:
-            foliage_mask = detect_tree_crown(rgba, progress)
+        if args.crown_mode == "auto" and foliage_mask is None:
+            if args.crown_threshold == 0.5:
+                foliage_mask = detect_tree_crown(rgba, progress)
+            else:
+                foliage_mask = detect_tree_crown(rgba, progress, threshold=args.crown_threshold)
         convention = "OpenGL" if args.convention == "opengl" else "DirectX"
         progress("Генерация AI Normal...")
         vectors = DSINENormalModel(args.dsine_fov).generate(rgba, progress)
@@ -240,7 +259,7 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
         vectors = postprocess_ai_vectors(
             vectors, rgba, args.ai_smoothing, args.ai_details,
         )
-        if foliage_mask is not None:
+        if args.crown_mode == "auto" and foliage_mask is not None:
             vectors = compose_crown_normals(vectors, foliage_mask, rgba[..., 3])
         normal = ai_normal(vectors, rgba[..., 3], convention)
 
@@ -254,8 +273,11 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
         export_normal(source_path, normal, output)
     if wants_albedo:
         progress("Генерация Albedo...")
-        albedo = generate_albedo(rgba, progress, debug=args.albedo_debug is not None,
-                                 debug_dir=args.albedo_debug)
+        albedo = generate_albedo(
+            rgba, progress, strength=args.albedo_strength,
+            illumination_sigma=args.albedo_smooth, shadow_strength=args.albedo_shadows,
+            debug=args.albedo_debug is not None, debug_dir=args.albedo_debug,
+        )
         export_albedo(source_path, albedo, output)
     if args.save_project:
         output.mkdir(parents=True, exist_ok=True)
@@ -284,8 +306,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.skip_cuda and args.models == "none":
             parser.error("--skip-cuda с --models none ничего не делает")
         return _setup_command(args, reporter)
-    if args.depth_map and (len(args.input) != 1 or args.input[0].suffix.lower() == ".ssoul"):
-        parser.error("--depth-map допустим только с одним исходным PNG")
+    if args.depth_map and args.maps not in ("both", "depth", "ao", "all") and not args.save_project:
+        parser.error("--depth-map применяется только при генерации Depth, AO или сохранении проекта")
+    if args.depth_map and len(args.input) > 1 and not args.depth_map.is_dir():
+        parser.error("для нескольких входов --depth-map должен указывать каталог с <имя>_depth.png")
     if args.albedo_debug and args.maps not in ("albedo", "all"):
         parser.error("--albedo-debug применяется только при экспорте Albedo")
     if args.ao_radius < 1 or args.ao_radius > 128:

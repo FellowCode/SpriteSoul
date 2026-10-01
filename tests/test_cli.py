@@ -92,6 +92,194 @@ def test_cli_ao_from_existing_depth_map_skips_model(tmp_path, monkeypatch):
     assert not (output / "sprite_depth.png").exists()
 
 
+def test_cli_batch_ao_uses_matching_depth_maps(tmp_path, monkeypatch):
+    from smg import setup
+    from smg.depth import inference
+
+    monkeypatch.setattr(setup, "prepare_environment", lambda *args, **kwargs:
+                        (_ for _ in ()).throw(AssertionError("Depth AI is unnecessary")))
+    monkeypatch.setattr(inference, "DepthModel", lambda:
+                        (_ for _ in ()).throw(AssertionError("Depth AI is unnecessary")))
+    depth_dir = tmp_path / "depth_maps"
+    depth_dir.mkdir()
+    sources = []
+    for name, shape in (("one", (8, 11)), ("two", (9, 12))):
+        source = tmp_path / f"{name}.png"
+        rgba = np.full((*shape, 4), 100, np.uint8)
+        rgba[..., 3] = 255
+        Image.fromarray(rgba).save(source)
+        depth = np.full(shape, 200, np.uint8)
+        depth[3:5, 4:7] = 40
+        assert cv2.imwrite(str(depth_dir / f"{name}_depth.png"), depth)
+        sources.append(source)
+
+    output = tmp_path / "out"
+    assert main([*(str(source) for source in sources), "-o", str(output),
+                 "--maps", "ao", "--depth-map", str(depth_dir)]) == 0
+    for name, shape in (("one", (8, 11)), ("two", (9, 12))):
+        ao = open_png(output / f"{name}_ao.png")
+        assert ao.shape[:2] == shape
+        assert ao[3, 5, 0] < ao[2, 3, 0]
+
+
+def test_cli_project_depth_can_be_overridden_by_png(tmp_path, monkeypatch):
+    from smg import setup
+
+    monkeypatch.setattr(setup, "prepare_environment", lambda *args, **kwargs:
+                        (_ for _ in ()).throw(AssertionError("Depth AI is unnecessary")))
+    source = tmp_path / "sprite.png"
+    rgba = _source(source)
+    project = tmp_path / "sprite.ssoul"
+    save_project(project, source, np.full(rgba.shape[:2], 0.75, np.float32),
+                 20.0, "OpenGL")
+    replacement = np.full(rgba.shape[:2], 64, np.uint8)
+    depth_map = tmp_path / "replacement.png"
+    assert cv2.imwrite(str(depth_map), replacement)
+
+    output = tmp_path / "out"
+    assert main([str(project), "-o", str(output), "--maps", "depth",
+                 "--depth-map", str(depth_map)]) == 0
+    depth = cv2.imread(str(output / "sprite_depth.png"), cv2.IMREAD_UNCHANGED)
+    assert np.array_equal(depth[..., 0], np.full(rgba.shape[:2], 64 * 257, np.uint16))
+
+
+def test_cli_rejects_depth_map_with_wrong_sprite_size(tmp_path, monkeypatch, capsys):
+    from smg import setup
+
+    monkeypatch.setattr(setup, "prepare_environment", lambda *args, **kwargs:
+                        (_ for _ in ()).throw(AssertionError("Invalid map reached model setup")))
+    source = tmp_path / "sprite.png"
+    _source(source)
+    depth_map = tmp_path / "wrong_depth.png"
+    assert cv2.imwrite(str(depth_map), np.zeros((7, 11), np.uint8))
+    output = tmp_path / "out"
+    assert main([str(source), "-o", str(output), "--maps", "ao",
+                 "--depth-map", str(depth_map)]) == 1
+    assert "11x7" in capsys.readouterr().err
+    assert not output.exists()
+
+
+def test_cli_rejects_irrelevant_or_unmatched_depth_map(tmp_path):
+    source = tmp_path / "sprite.png"
+    _source(source)
+    with pytest.raises(SystemExit) as exc:
+        main([str(source), "--maps", "normal", "--depth-map", str(tmp_path / "depth.png")])
+    assert exc.value.code == 2
+    with pytest.raises(SystemExit) as exc:
+        main([str(source), str(source), "--maps", "ao",
+              "--depth-map", str(tmp_path / "depth.png")])
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("project_args", [[], ["--no-save-project"],
+                                          ["--save-project", "--no-save-project"]])
+@pytest.mark.parametrize("mode,expected_models,expected_suffixes", [
+    ("both", ("depth", "ai", "clipseg"), {"depth", "normal"}),
+    ("depth", ("depth",), {"depth"}),
+    ("normal", ("ai", "clipseg"), {"normal"}),
+    ("albedo", ("albedo",), {"albedo"}),
+    ("ao", ("depth",), {"ao"}),
+    ("all", ("depth", "ai", "clipseg", "albedo"),
+     {"depth", "normal", "albedo", "ao"}),
+])
+def test_cli_generates_selected_maps(tmp_path, monkeypatch, mode, expected_models,
+                                     expected_suffixes, project_args):
+    from smg import albedo_ai, export, normal_ai, segmentation, setup
+    from smg.depth import inference
+
+    prepared = []
+    monkeypatch.setattr(setup, "prepare_environment",
+                        lambda models, progress, events=None: prepared.append(tuple(models)))
+
+    class FakeDepth:
+        def generate(self, rgba, progress=None):
+            return np.tile(np.arange(rgba.shape[1], dtype=np.float32), (rgba.shape[0], 1))
+
+    class FakeNormal:
+        def __init__(self, fov):
+            assert fov == 60
+
+        def generate(self, rgba, progress=None):
+            vectors = np.zeros((*rgba.shape[:2], 3), np.float32)
+            vectors[..., 2] = 1
+            return vectors
+
+    monkeypatch.setattr(inference, "DepthModel", FakeDepth)
+    monkeypatch.setattr(normal_ai, "DSINENormalModel", FakeNormal)
+    monkeypatch.setattr(segmentation, "detect_tree_crown", lambda rgba, progress: None)
+    monkeypatch.setattr(albedo_ai, "generate_albedo", lambda rgba, progress, **kwargs: rgba.copy())
+
+    def unexpected_save(*args, **kwargs):
+        raise AssertionError("Direct export must not save a project")
+
+    monkeypatch.setattr(export, "save_project", unexpected_save)
+
+    source = tmp_path / "sprite.png"
+    _source(source)
+    output = tmp_path / "out"
+    assert main(["generate", str(source), "-o", str(output), "--maps", mode,
+                 *project_args]) == 0
+    assert prepared == [expected_models]
+    assert {path.name for path in output.iterdir()} == {
+        f"sprite_{suffix}.png" for suffix in expected_suffixes
+    }
+
+
+def test_cli_passes_albedo_settings(tmp_path, monkeypatch):
+    from smg import albedo_ai, setup
+
+    monkeypatch.setattr(setup, "prepare_environment", lambda *args, **kwargs: None)
+    received = []
+
+    def fake_albedo(rgba, progress, **kwargs):
+        received.append(kwargs)
+        return rgba.copy()
+
+    monkeypatch.setattr(albedo_ai, "generate_albedo", fake_albedo)
+    source = tmp_path / "sprite.png"
+    _source(source)
+    debug = tmp_path / "debug"
+    assert main([str(source), "-o", str(tmp_path / "out"), "--maps", "albedo",
+                 "--albedo-strength", "1.4", "--albedo-smooth", "3",
+                 "--albedo-shadows", "0.6", "--albedo-debug", str(debug)]) == 0
+    assert received == [{"strength": 1.4, "illumination_sigma": 3.0,
+                         "shadow_strength": 0.6, "debug": True, "debug_dir": debug}]
+
+
+def test_cli_crown_controls(tmp_path, monkeypatch):
+    from smg import normal_ai, segmentation, setup
+
+    prepared = []
+    monkeypatch.setattr(setup, "prepare_environment",
+                        lambda models, progress, events=None: prepared.append(tuple(models)))
+
+    class FakeNormal:
+        def __init__(self, fov):
+            pass
+
+        def generate(self, rgba, progress=None):
+            vectors = np.zeros((*rgba.shape[:2], 3), np.float32)
+            vectors[..., 2] = 1
+            return vectors
+
+    monkeypatch.setattr(normal_ai, "DSINENormalModel", FakeNormal)
+    thresholds = []
+
+    def detect(rgba, progress, threshold=0.5):
+        thresholds.append(threshold)
+        return None
+
+    monkeypatch.setattr(segmentation, "detect_tree_crown", detect)
+    source = tmp_path / "sprite.png"
+    _source(source)
+    assert main([str(source), "-o", str(tmp_path / "auto"), "--maps", "normal",
+                 "--crown-threshold", "0.7"]) == 0
+    assert main([str(source), "-o", str(tmp_path / "off"), "--maps", "normal",
+                 "--crown-mode", "off"]) == 0
+    assert prepared == [("ai", "clipseg"), ("ai",)]
+    assert thresholds == [0.7]
+
+
 def test_cli_batch_and_existing_output(tmp_path, monkeypatch):
     from smg.depth import inference
     from smg import setup
@@ -179,6 +367,13 @@ def test_cli_round_trip_preserves_project_foliage_mask(tmp_path):
     )
     assert np.array_equal(saved_depth, depth)
     assert np.array_equal(restored, mask)
+
+    output_without_crown = tmp_path / "out_without_crown"
+    assert main([str(project), "-o", str(output_without_crown), "--maps", "depth",
+                 "--crown-mode", "off", "--save-project"]) == 0
+    *_, preserved = load_project(output_without_crown / "foliage.ssoul",
+                                 with_foliage_mask=True)
+    assert np.array_equal(preserved, mask)
 
 
 def test_cli_applies_saved_crown_mask_to_ai_normal(tmp_path, monkeypatch):
@@ -292,4 +487,7 @@ def test_cli_help_lists_commands_and_progress(capsys):
     assert "--normal-source" in generate_help
     assert "--ai-smoothing" in generate_help
     assert "--ai-details" in generate_help
+    assert "--crown-threshold" in generate_help
+    assert "--albedo-strength" in generate_help
+    assert "--no-save-project" in generate_help
     assert "hybrid" not in generate_help.lower()

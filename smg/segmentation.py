@@ -144,25 +144,27 @@ def expand_crown_mask(seed_mask: np.ndarray, rgba: np.ndarray) -> np.ndarray:
     return result & opaque
 
 
-def tree_crown_mask(scores: np.ndarray, rgba: np.ndarray) -> np.ndarray | None:
+def tree_crown_mask(scores: np.ndarray, rgba: np.ndarray,
+                    threshold: float = DEFAULT_CROWN_THRESHOLD) -> np.ndarray | None:
     """Return the expanded crown only when it covers over 40% of opaque pixels."""
     if rgba.ndim != 3 or rgba.shape[-1] != 4 or rgba.dtype != np.uint8:
         raise ValueError("Определение дерева ожидает RGBA uint8")
     opaque_count = np.count_nonzero(rgba[..., 3])
     if opaque_count == 0:
         return None
-    seed = crown_mask(scores, rgba[..., 3], DEFAULT_CROWN_THRESHOLD)
+    seed = crown_mask(scores, rgba[..., 3], threshold)
     mask = expand_crown_mask(seed, rgba)
     return mask if np.count_nonzero(mask) > TREE_CROWN_FRACTION * opaque_count else None
 
 
-def detect_tree_crown(rgba: np.ndarray, progress=None) -> np.ndarray | None:
+def detect_tree_crown(rgba: np.ndarray, progress=None,
+                      threshold: float = DEFAULT_CROWN_THRESHOLD) -> np.ndarray | None:
     """Use CLIPSeg to classify a sprite and return its crown if it is a tree."""
     if rgba.ndim != 3 or rgba.shape[-1] != 4 or rgba.dtype != np.uint8:
         raise ValueError("Определение дерева ожидает RGBA uint8")
     if not np.any(rgba[..., 3]):
         return None
-    mask = tree_crown_mask(predict_crown_scores(rgba, progress), rgba)
+    mask = tree_crown_mask(predict_crown_scores(rgba, progress), rgba, threshold)
     if progress:
         progress("Дерево: крона найдена" if mask is not None else "Крона меньше 40%: обычная Normal")
     return mask

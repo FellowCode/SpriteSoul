@@ -19,7 +19,7 @@ PNG / Atlas
     ↓
 Depth AI
     ↓
-Depth processing / manual correction
+Depth processing
     ↓
 FINAL DEPTH
     ↓
@@ -106,13 +106,9 @@ AI Depth является исходной оценкой, а не оконча�
 - Invert Depth;
 - Depth Range / Strength;
 - Contrast;
-- Smooth;
-- Raise brush;
-- Lower brush;
-- Smooth brush;
-- Undo / Redo.
+- Smooth.
 
-Все ручные инструменты меняют только Depth.
+Общие параметры обработки меняют только Depth. Ручное редактирование кистями и Undo / Redo удалены.
 
 После изменения Depth Normal должна пересчитываться автоматически.
 
@@ -192,7 +188,7 @@ Tile/crop processing не должен менять положение спра�
 Минимальные действия:
 
 ```text
-Open | Generate | Undo | Redo | Export
+Open | Generate | Export
 ```
 
 Основные режимы просмотра:
@@ -208,9 +204,7 @@ Source | Depth | Normal | Lighting Preview
 - checkerboard transparency;
 - настройки Depth;
 - Normal Strength;
-- OpenGL/DirectX;
-- radius/strength кисти;
-- Raise/Lower/Smooth brush.
+- OpenGL/DirectX.
 
 Не тратить код на декоративный интерфейс или собственный UI framework.
 
@@ -250,7 +244,7 @@ Normal:
 
 Не применять художественную color/gamma correction к normal map.
 
-Желательно сохранять рабочее состояние Depth, чтобы ручные правки можно было продолжить после перезапуска приложения. Реализовать самым простым способом: например, sidecar/project file + сохранённая float/16-bit depth.
+Желательно сохранять итоговую Depth для просмотра, обработки и экспорта после перезапуска приложения. Реализовать самым простым способом: например, sidecar/project file + сохранённая float/16-bit depth.
 
 ---
 
@@ -265,7 +259,6 @@ Normal:
 - Depth AI inference;
 - Depth post-processing;
 - генерацию Normal;
-- редактор Depth;
 - atlas/tile processing;
 - GUI;
 - экспорт и сохранение проекта.
@@ -282,7 +275,6 @@ sprite-soul/
             processing.py
         normal.py
         atlas.py
-        editor.py
         export.py
         ui/
             main_window.py
@@ -303,7 +295,7 @@ sprite-soul/
 - GUI использует общий pipeline и не дублирует алгоритмы Depth/Normal.
 - Код конкретной Depth-модели отделён от обработки изображения и GUI, чтобы модель можно было заменить локально.
 - Для математических преобразований предпочитать небольшие чистые функции.
-- Классы использовать там, где действительно есть состояние: GUI, editor, Undo/Redo, lifecycle модели.
+- Классы использовать там, где действительно есть состояние: GUI, lifecycle модели.
 - Не создавать interface/factory/plugin-system только ради возможного будущего расширения.
 - Для потенциально заменяемого компонента достаточно простой и стабильной границы модуля/API.
 - Избегать глобального изменяемого состояния.
@@ -365,7 +357,7 @@ PNG → Depth → Normal → Export
 
 ### Этап 2
 
-Добавить Depth processing и ручные кисти.
+Добавить общие параметры Depth processing.
 
 ### Этап 3
 
@@ -389,7 +381,7 @@ PNG → Depth → Normal → Export
 
 1. открыть PNG-спрайт или atlas;
 2. получить Depth через AI;
-3. поправить Depth кистями;
+3. настроить общие параметры обработки Depth;
 4. автоматически получить Normal из исправленной Depth;
 5. проверить результат движущимся источником света;
 6. экспортировать Depth и Normal;
@@ -410,7 +402,7 @@ PNG → Depth → Normal → Export
 
 Не пересказывай ТЗ и не создавай длинный план. Сразу изучи репозиторий и начинай реализацию.
 
-Не делай enterprise-архитектуру и не добавляй абстракции «на будущее». При этом не создавай монолитные модули, если разделение заметно упрощает дальнейшее изменение Depth, Normal, editor, atlas или GUI.
+Не делай enterprise-архитектуру и не добавляй абстракции «на будущее». При этом не создавай монолитные модули, если разделение заметно упрощает дальнейшее изменение Depth, Normal, atlas или GUI.
 
 Используй готовые возможности PyTorch, NumPy, OpenCV и PySide6 вместо собственного инфраструктурного кода.
 
@@ -427,7 +419,7 @@ PNG → Depth → Normal → Export
 - Normal только из FINAL Depth;
 - корректный OpenGL +Y;
 - отсутствие ложного silhouette bevel;
-- возможность ручной коррекции Depth;
+- общие параметры обработки Depth;
 - Lighting Preview;
 - работа на RTX 3060 Laptop 6 GB.
 

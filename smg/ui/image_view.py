@@ -15,7 +15,6 @@ def image_from_array(pixels: np.ndarray) -> QImage:
 
 
 class ImageView(QGraphicsView):
-    brush_event = Signal(str, int, int)
     light_changed = Signal(float, float)
 
     def __init__(self, parent=None):
@@ -27,7 +26,6 @@ class ImageView(QGraphicsView):
         self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.mode = "Source"
-        self.tool = "Pan"
         self._dragging = False
         self._has_image = False
         self.set_dark_theme(False)
@@ -71,10 +69,6 @@ class ImageView(QGraphicsView):
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton and self._has_image:
-            if self.mode == "Depth" and self.tool != "Pan":
-                self._dragging = True
-                self.brush_event.emit("begin", *self._position(event))
-                return
             if self.mode == "Lighting Preview":
                 self._dragging = True
                 self._emit_light(event)
@@ -83,17 +77,12 @@ class ImageView(QGraphicsView):
 
     def mouseMoveEvent(self, event) -> None:
         if self._dragging:
-            if self.mode == "Depth":
-                self.brush_event.emit("move", *self._position(event))
-            else:
-                self._emit_light(event)
+            self._emit_light(event)
             return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
         if self._dragging and event.button() == Qt.LeftButton:
             self._dragging = False
-            if self.mode == "Depth":
-                self.brush_event.emit("end", *self._position(event))
             return
         super().mouseReleaseEvent(event)

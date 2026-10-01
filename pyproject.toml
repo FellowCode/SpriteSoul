@@ -1,7 +1,7 @@
 [project]
 name = "sprite-soul"
 version = "0.1.0"
-description = "Local depth and normal map editor for PNG sprites"
+description = "Local depth and normal map generator for PNG sprites"
 requires-python = ">=3.11,<3.14"
 dependencies = [
   "numpy>=1.26,<3",

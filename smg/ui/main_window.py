@@ -6,21 +6,21 @@ from PySide6.QtGui import QAction, QGuiApplication, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame,
     QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QProgressBar, QSlider,
-    QSpinBox, QStatusBar, QToolBar, QVBoxLayout, QWidget,
+    QScrollArea, QSizePolicy, QSpinBox, QStatusBar, QToolBar, QVBoxLayout, QWidget,
 )
 
 from smg.depth.inference import DepthModel
 from smg.ao import ao_from_depth
 from smg.albedo_ai import generate_albedo
 from smg.crown_normal import compose_crown_normals
-from smg.depth.processing import DepthSettings
-from smg.editor import DepthEditor
+from smg.depth.processing import DepthSettings, process_depth
 from smg.export import export_albedo, export_ao, export_depth, export_normal, load_project, save_project
 from smg.normal import ai_normal, orient_ai_vectors, postprocess_ai_vectors
 from smg.normal_ai import DSINENormalModel
 from smg.pipeline import generate_depth, open_png
 from smg.segmentation import crown_mask, detect_tree_crown, expand_crown_mask, predict_crown_scores
 from smg.setup import MODEL_LABELS, missing_models, prepare_environment
+from smg.ui.control_section import ControlSection, FocusWheelGuard
 from smg.ui.image_view import ImageView
 from smg.ui.lighting_preview import render_lighting
 
@@ -182,7 +182,8 @@ class MainWindow(QMainWindow):
         self.resize(1180, 760)
         self.source_path: Path | None = None
         self.source: np.ndarray | None = None
-        self.editor: DepthEditor | None = None
+        self.base_depth: np.ndarray | None = None
+        self.depth: np.ndarray | None = None
         self._preview_ao: np.ndarray | None = None
         self._show_ao_after_generation = False
         self._preview_normal: np.ndarray | None = None
@@ -240,12 +241,10 @@ class MainWindow(QMainWindow):
             self.generate_albedo_action, self.generate_all_action,
         ):
             self.generate_menu.addAction(action)
-        self.undo_action = self._action("Отменить", "Ctrl+Z", self.undo)
-        self.redo_action = self._action("Повторить", "Ctrl+Y", self.redo)
         self.export_action = self._action("Экспорт", "Ctrl+E", self.export)
         for action in (
             self.open_action, self.setup_action, self.generate_menu.menuAction(),
-            self.select_foliage_action, self.undo_action, self.redo_action, self.export_action,
+            self.export_action,
         ):
             toolbar.addAction(action)
         toolbar.addSeparator()
@@ -258,43 +257,69 @@ class MainWindow(QMainWindow):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(0)
         self.view = ImageView()
-        self.view.brush_event.connect(self._brush_event)
         self.view.light_changed.connect(self._light_changed)
         row.addWidget(self.view, 1)
 
         panel = QFrame()
         panel.setObjectName("controls")
-        panel.setFixedWidth(244)
+        panel.setFixedWidth(320)
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         row.addWidget(panel)
 
-        layout.addWidget(QLabel("Просмотр"))
+        preview = QWidget()
+        preview_layout = QVBoxLayout(preview)
+        preview_layout.setContentsMargins(16, 16, 16, 14)
+        preview_layout.setSpacing(8)
+        title = QLabel("Настройки")
+        title.setObjectName("panelTitle")
+        preview_layout.addWidget(title)
+        preview_layout.addWidget(QLabel("Просмотр карты"))
         self.mode = QComboBox()
         self.mode.addItems(("Source", "Albedo", "Depth", "AO", "Normal", "Lighting Preview", "Маска кроны"))
+        self.mode.setAccessibleName("Просмотр карты")
         self.mode.currentTextChanged.connect(self._mode_changed)
-        layout.addWidget(self.mode)
+        preview_layout.addWidget(self.mode)
+        layout.addWidget(preview)
 
-        layout.addWidget(QLabel("Depth"))
-        self.invert = QCheckBox("Invert Depth")
+        self.controls_scroll = QScrollArea()
+        self.controls_scroll.setObjectName("controlsScroll")
+        self.controls_scroll.setWidgetResizable(True)
+        self.controls_scroll.setFrameShape(QFrame.NoFrame)
+        self.controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.controls_scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        groups = QWidget()
+        groups.setObjectName("controlGroups")
+        groups_layout = QVBoxLayout(groups)
+        groups_layout.setContentsMargins(12, 0, 12, 12)
+        groups_layout.setSpacing(8)
+        self.controls_scroll.setWidget(groups)
+        layout.addWidget(self.controls_scroll, 1)
+
+        self.depth_section = ControlSection("Глубина · Depth", "Общий рельеф и мягкость карты глубины.")
+        groups_layout.addWidget(self.depth_section)
+        self.invert = QCheckBox("Инвертировать глубину")
         self.invert.toggled.connect(self._settings_changed)
-        layout.addWidget(self.invert)
-        form = QFormLayout()
-        layout.addLayout(form)
+        self.depth_section.content_layout.addWidget(self.invert)
+        form = self._control_form(self.depth_section.content_layout)
         self.depth_strength = self._slider(1, 300, 100, self._settings_changed)
         self.contrast = self._slider(25, 300, 100, self._settings_changed)
         self.smooth = self._slider(0, 80, 0, self._settings_changed)
-        form.addRow("Range", self.depth_strength)
-        form.addRow("Contrast", self.contrast)
-        form.addRow("Smooth", self.smooth)
+        self.depth_strength.setAccessibleName("Диапазон глубины")
+        self.contrast.setAccessibleName("Контраст глубины")
+        self.smooth.setAccessibleName("Сглаживание глубины")
+        form.addRow("Диапазон", self._slider_field(self.depth_strength, lambda v: f"{v / 100:.2f}×"))
+        form.addRow("Контраст", self._slider_field(self.contrast, lambda v: f"{v / 100:.2f}×"))
+        form.addRow("Сглаживание", self._slider_field(self.smooth, lambda v: f"{v / 10:.1f}"))
 
-        layout.addWidget(QLabel("Ambient Occlusion"))
-        ao_form = QFormLayout()
-        layout.addLayout(ao_form)
+        self.ao_section = ControlSection("Затенение · AO", "Затемнение углублений на основе Depth.")
+        groups_layout.addWidget(self.ao_section)
+        ao_form = self._control_form(self.ao_section.content_layout)
         self.ao_radius = QSpinBox()
         self.ao_radius.setRange(1, 128)
         self.ao_radius.setValue(24)
+        self.ao_radius.setSuffix(" px")
         self.ao_radius.valueChanged.connect(self._ao_changed)
         ao_form.addRow("Радиус", self.ao_radius)
         self.ao_strength = QDoubleSpinBox()
@@ -304,14 +329,13 @@ class MainWindow(QMainWindow):
         self.ao_strength.valueChanged.connect(self._ao_changed)
         ao_form.addRow("Сила", self.ao_strength)
 
-        layout.addWidget(QLabel("Normal"))
-        normal_form = QFormLayout()
-        layout.addLayout(normal_form)
+        self.normal_section = ControlSection("Нормали · Normal", "Сглаживание и мелкий рельеф карты AI (DSINE).")
+        groups_layout.addWidget(self.normal_section)
+        normal_form = self._control_form(self.normal_section.content_layout)
         self.convention = QComboBox()
         self.convention.addItems(("OpenGL", "DirectX"))
         self.convention.currentTextChanged.connect(self._normal_changed)
-        normal_form.addRow("Format", self.convention)
-        normal_form.addRow("Источник", QLabel("AI (DSINE)"))
+        normal_form.addRow("Формат", self.convention)
         self.ai_smoothing = QDoubleSpinBox()
         self.ai_smoothing.setRange(0, 8)
         self.ai_smoothing.setSingleStep(0.25)
@@ -326,27 +350,45 @@ class MainWindow(QMainWindow):
         self.ai_details.setValue(0.35)
         self.ai_details.valueChanged.connect(self._normal_changed)
         normal_form.addRow("Детали", self.ai_details)
+
+        self.normal_advanced = ControlSection("Дополнительно")
+        self.normal_advanced.setObjectName("advancedSection")
+        self.normal_section.content_layout.addWidget(self.normal_advanced)
+        advanced_form = self._control_form(self.normal_advanced.content_layout)
         self.ai_fov = QSpinBox()
         self.ai_fov.setRange(20, 120)
         self.ai_fov.setValue(60)
         self.ai_fov.setSuffix("°")
+        self.ai_fov.setToolTip("Угол обзора DSINE. Изменение запускает повторную генерацию нормалей.")
         self.ai_fov.valueChanged.connect(self._fov_changed)
-        normal_form.addRow("DSINE FOV", self.ai_fov)
-        self.invert_ai_x = QCheckBox("Invert AI X")
+        advanced_form.addRow("Угол обзора", self.ai_fov)
+        self.invert_ai_x = QCheckBox("Инвертировать X")
         self.invert_ai_x.setChecked(True)
         self.invert_ai_x.toggled.connect(self._normal_changed)
-        normal_form.addRow(self.invert_ai_x)
-        self.invert_ai_y = QCheckBox("Invert AI Y")
+        advanced_form.addRow(self.invert_ai_x)
+        self.invert_ai_y = QCheckBox("Инвертировать Y")
         self.invert_ai_y.setChecked(True)
         self.invert_ai_y.toggled.connect(self._normal_changed)
-        normal_form.addRow(self.invert_ai_y)
+        advanced_form.addRow(self.invert_ai_y)
 
-        layout.addWidget(QLabel("Крона (CLIPSeg)"))
-        selection_form = QFormLayout()
-        layout.addLayout(selection_form)
+        self.crown_section = ControlSection("Маска кроны")
+        groups_layout.addWidget(self.crown_section)
+        self.crown_status = QLabel()
+        self.crown_status.setObjectName("controlHelp")
+        self.crown_status.setWordWrap(True)
+        self.crown_section.content_layout.addWidget(self.crown_status)
+        self.selection_start = QPushButton("Определить крону")
+        self.selection_start.clicked.connect(self.select_foliage_action.trigger)
+        self.crown_section.content_layout.addWidget(self.selection_start)
+        self.selection_controls = QWidget()
+        selection_layout = QVBoxLayout(self.selection_controls)
+        selection_layout.setContentsMargins(0, 0, 0, 0)
+        selection_layout.setSpacing(10)
+        selection_form = self._control_form(selection_layout)
         self.selection_threshold = QSlider(Qt.Horizontal)
         self.selection_threshold.setRange(0, 100)
         self.selection_threshold.setValue(50)
+        self.selection_threshold.setAccessibleName("Порог выделения кроны")
         self.selection_threshold.valueChanged.connect(self._selection_threshold_changed)
         self.selection_threshold_label = QLabel("0.50")
         threshold_row = QHBoxLayout()
@@ -354,30 +396,54 @@ class MainWindow(QMainWindow):
         threshold_row.addWidget(self.selection_threshold_label)
         selection_form.addRow("Порог", threshold_row)
         self.selection_done = QPushButton("Готово")
+        self.selection_done.setObjectName("primaryButton")
         self.selection_done.clicked.connect(self.finish_foliage_selection)
         self.selection_cancel = QPushButton("Отмена")
         self.selection_cancel.clicked.connect(self.cancel_foliage_selection)
-        selection_form.addRow(self.selection_done)
-        selection_form.addRow(self.selection_cancel)
+        selection_actions = QHBoxLayout()
+        selection_actions.addWidget(self.selection_cancel)
+        selection_actions.addWidget(self.selection_done)
+        selection_layout.addLayout(selection_actions)
+        self.crown_section.content_layout.addWidget(self.selection_controls)
+        self.selection_controls.hide()
+        self._controls_selecting = False
 
-        layout.addWidget(QLabel("Кисть"))
-        self.tool = QComboBox()
-        self.tool.addItems(("Pan", "Raise", "Lower", "Smooth"))
-        self.tool.currentTextChanged.connect(self._tool_changed)
-        layout.addWidget(self.tool)
-        brush_form = QFormLayout()
-        layout.addLayout(brush_form)
-        self.radius = QSpinBox()
-        self.radius.setRange(1, 256)
-        self.radius.setValue(24)
-        self.brush_strength = self._slider(1, 100, 12, lambda _value: None)
-        brush_form.addRow("Radius", self.radius)
-        brush_form.addRow("Strength", self.brush_strength)
-        layout.addStretch()
-        self.hint = QLabel("В режиме Lighting Preview тяните мышью по изображению, чтобы переместить свет.")
+        groups_layout.addStretch()
+        self.hint = QLabel()
         self.hint.setObjectName("hint")
         self.hint.setWordWrap(True)
+        self.hint.setContentsMargins(16, 12, 16, 14)
         layout.addWidget(self.hint)
+        self._wheel_guard = FocusWheelGuard(self.controls_scroll)
+        for field in groups.findChildren(QWidget):
+            if isinstance(field, (QComboBox, QSpinBox, QDoubleSpinBox, QSlider)):
+                field.setFocusPolicy(Qt.StrongFocus)
+                field.installEventFilter(self._wheel_guard)
+
+    @staticmethod
+    def _control_form(layout: QVBoxLayout) -> QFormLayout:
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(8)
+        layout.addLayout(form)
+        return form
+
+    @staticmethod
+    def _slider_field(slider: QSlider, format_value) -> QWidget:
+        field = QWidget()
+        layout = QHBoxLayout(field)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        value = QLabel(format_value(slider.value()))
+        value.setObjectName("controlValue")
+        value.setMinimumWidth(42)
+        value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        slider.valueChanged.connect(lambda v: value.setText(format_value(v)))
+        layout.addWidget(slider, 1)
+        layout.addWidget(value)
+        return field
 
     def _apply_system_theme(self, scheme=None) -> None:
         """Keep custom controls in step with Qt's system colour-scheme support."""
@@ -389,19 +455,92 @@ class MainWindow(QMainWindow):
                 "panel": "#20252e", "panel_border": "#3a4352", "text": "#e7edf5",
                 "muted": "#aeb9c8", "field": "#2b313c", "field_border": "#59687b",
                 "hover": "#8ea2b8", "focus": "#5aa9e6", "drop_down": "#3b4656",
+                "section": "#282e38", "header_hover": "#333c49", "disabled": "#788392",
             }
         else:
             colors = {
                 "panel": "#f5f6f8", "panel_border": "#d7dbe1", "text": "#252b34",
                 "muted": "#6b7280", "field": "#ffffff", "field_border": "#aeb7c2",
                 "hover": "#66788b", "focus": "#3074a8", "drop_down": "#354454",
+                "section": "#ffffff", "header_hover": "#edf1f5", "disabled": "#929aa6",
             }
         arrow_icon = (Path(__file__).resolve().parent / "icons" / "chevron-down.svg").as_posix()
+        up_arrow_icon = (Path(__file__).resolve().parent / "icons" / "chevron-up.svg").as_posix()
         styles = """
             QFrame#controls { background: %(panel)s; border-left: 1px solid %(panel_border)s; }
             QFrame#controls QLabel, QFrame#controls QCheckBox { color: %(text)s; }
-            QFrame#controls QLabel#hint { color: %(muted)s; }
+            QFrame#controls QLabel#panelTitle { font-size: 16px; font-weight: 600; }
+            QFrame#controls QLabel#hint {
+                color: %(muted)s;
+                border-top: 1px solid %(panel_border)s;
+            }
+            QFrame#controls QLabel#controlHelp { color: %(muted)s; }
+            QFrame#controls QLabel#controlValue { color: %(muted)s; }
+            QFrame#controls QLabel:disabled, QFrame#controls QCheckBox:disabled { color: %(disabled)s; }
+            QScrollArea#controlsScroll, QWidget#controlGroups { background: %(panel)s; border: none; }
+            QFrame#controls QScrollBar:vertical { background: %(panel)s; width: 10px; margin: 4px 2px; }
+            QFrame#controls QScrollBar::handle:vertical {
+                background: %(field_border)s;
+                border-radius: 3px;
+                min-height: 24px;
+            }
+            QFrame#controls QScrollBar::handle:vertical:hover { background: %(hover)s; }
+            QFrame#controls QScrollBar::add-line:vertical, QFrame#controls QScrollBar::sub-line:vertical { height: 0; }
+            QFrame#controls QScrollBar::add-page:vertical, QFrame#controls QScrollBar::sub-page:vertical { background: transparent; }
+            QFrame#controlSection {
+                background: %(section)s;
+                border: 1px solid %(panel_border)s;
+                border-radius: 7px;
+            }
+            QFrame#advancedSection {
+                background: %(panel)s;
+                border: 1px solid %(panel_border)s;
+                border-radius: 5px;
+            }
+            QToolButton#sectionHeader {
+                color: %(text)s;
+                background: transparent;
+                border: 1px solid transparent;
+                border-radius: 6px;
+                text-align: left;
+                font-weight: 600;
+                min-height: 22px;
+                padding: 8px 10px;
+            }
+            QToolButton#sectionHeader:hover { background: %(header_hover)s; }
+            QToolButton#sectionHeader:focus { border-color: %(focus)s; }
+            QToolButton#sectionHeader:disabled { color: %(disabled)s; }
+            QFrame#advancedSection QToolButton#sectionHeader { padding: 5px 8px; font-weight: 400; }
+            QFrame#controls QPushButton {
+                color: %(text)s;
+                background: %(field)s;
+                border: 1px solid %(field_border)s;
+                border-radius: 4px;
+                min-height: 28px;
+                padding: 2px 10px;
+            }
+            QFrame#controls QPushButton:hover { background: %(header_hover)s; border-color: %(hover)s; }
+            QFrame#controls QPushButton:focus { border-color: %(focus)s; }
+            QFrame#controls QPushButton#primaryButton { background: %(focus)s; color: #ffffff; border-color: %(focus)s; }
+            QFrame#controls QPushButton:disabled { color: %(disabled)s; background: %(panel)s; border-color: %(panel_border)s; }
+            QFrame#controls QPushButton#primaryButton:disabled { color: %(disabled)s; background: %(panel)s; border-color: %(panel_border)s; }
             QSlider { min-height: 22px; }
+            QFrame#controls QSlider::groove:horizontal {
+                height: 4px;
+                background: %(panel_border)s;
+                border-radius: 2px;
+            }
+            QFrame#controls QSlider::sub-page:horizontal { background: %(focus)s; border-radius: 2px; }
+            QFrame#controls QSlider::handle:horizontal {
+                background: %(focus)s;
+                border: 2px solid %(section)s;
+                width: 12px;
+                margin: -6px 0;
+                border-radius: 8px;
+            }
+            QFrame#controls QSlider::handle:horizontal:hover { background: %(hover)s; }
+            QFrame#controls QSlider::handle:horizontal:disabled,
+            QFrame#controls QSlider::sub-page:horizontal:disabled { background: %(disabled)s; }
             QFrame#controls QComboBox, QFrame#controls QSpinBox, QFrame#controls QDoubleSpinBox {
                 color: %(text)s;
                 background: %(field)s;
@@ -411,11 +550,39 @@ class MainWindow(QMainWindow):
                 padding: 0 7px;
             }
             QFrame#controls QComboBox { padding-right: 29px; }
+            QFrame#controls QAbstractSpinBox { padding-right: 24px; }
+            QFrame#controls QAbstractSpinBox::up-button {
+                subcontrol-origin: border;
+                subcontrol-position: top right;
+                background: %(drop_down)s;
+                width: 20px;
+                height: 14px;
+                border-top-right-radius: 3px;
+            }
+            QFrame#controls QAbstractSpinBox::down-button {
+                subcontrol-origin: border;
+                subcontrol-position: bottom right;
+                background: %(drop_down)s;
+                width: 20px;
+                height: 14px;
+                border-bottom-right-radius: 3px;
+            }
+            QFrame#controls QAbstractSpinBox::up-button:hover,
+            QFrame#controls QAbstractSpinBox::down-button:hover { background: %(hover)s; }
+            QFrame#controls QAbstractSpinBox::up-button:disabled,
+            QFrame#controls QAbstractSpinBox::down-button:disabled { background: %(field_border)s; }
+            QFrame#controls QAbstractSpinBox::up-arrow { image: url(CHEVRON_UP_ICON); width: 10px; height: 10px; }
+            QFrame#controls QAbstractSpinBox::down-arrow { image: url(CHEVRON_ICON); width: 10px; height: 10px; }
             QFrame#controls QComboBox:hover, QFrame#controls QSpinBox:hover, QFrame#controls QDoubleSpinBox:hover {
                 border-color: %(hover)s;
             }
             QFrame#controls QComboBox:focus, QFrame#controls QSpinBox:focus, QFrame#controls QDoubleSpinBox:focus {
                 border-color: %(focus)s;
+            }
+            QFrame#controls QComboBox:disabled, QFrame#controls QSpinBox:disabled, QFrame#controls QDoubleSpinBox:disabled {
+                color: %(disabled)s;
+                background: %(panel)s;
+                border-color: %(panel_border)s;
             }
             QFrame#controls QComboBox::drop-down {
                 background: %(drop_down)s;
@@ -428,7 +595,7 @@ class MainWindow(QMainWindow):
                 height: 14px;
             }
         """ % colors
-        self.setStyleSheet(styles.replace("CHEVRON_ICON", arrow_icon))
+        self.setStyleSheet(styles.replace("CHEVRON_ICON", arrow_icon).replace("CHEVRON_UP_ICON", up_arrow_icon))
         self.view.set_dark_theme(dark)
 
     def _action(self, text: str, shortcut: str, callback) -> QAction:
@@ -462,18 +629,64 @@ class MainWindow(QMainWindow):
         self.ai_smoothing.setEnabled(not busy and not selecting)
         self.ai_details.setEnabled(not busy and not selecting)
         self.export_action.setEnabled(
-            (self.editor is not None or self.ai_vectors is not None or self.albedo is not None
+            (self.depth is not None or self.ai_vectors is not None or self.albedo is not None
              or self.foliage_mask is not None) and not busy and not selecting
         )
-        self.undo_action.setEnabled(self.editor is not None and bool(self.editor.strokes)
-                                    and not busy and not selecting)
-        self.redo_action.setEnabled(self.editor is not None and bool(self.editor.redo_strokes)
-                                    and not busy and not selecting)
         controls_enabled = selecting and self._selection_scores is not None and not self._selection_pending
         self.selection_threshold.setEnabled(controls_enabled)
         self.selection_done.setEnabled(controls_enabled and self._selection_mask is not None
                                        and bool(np.any(self._selection_mask)))
         self.selection_cancel.setEnabled(selecting)
+        self.selection_start.setEnabled(self.select_foliage_action.isEnabled())
+        self.selection_start.setVisible(not selecting)
+        self.selection_controls.setVisible(selecting)
+        self.depth_section.content.setEnabled(self.depth is not None and not busy and not selecting)
+        self.ao_section.content.setEnabled(self.depth is not None and not busy and not selecting)
+        self.normal_section.content.setEnabled(ready and not busy and not selecting)
+        if selecting != self._controls_selecting:
+            self._controls_selecting = selecting
+            self._focus_control_sections("Маска кроны" if selecting else self.mode.currentText())
+        if selecting:
+            self.crown_status.setText(
+                "CLIPSeg определяет крону…" if self._selection_pending else
+                "Голубым показана крона. Настройте порог и подтвердите выделение."
+            )
+        else:
+            self.crown_status.setText(
+                "Маска готова и учитывается в нормалях. Можно определить крону заново."
+                if self.foliage_mask is not None else
+                "Выделите листву, чтобы придать кроне объём в карте нормалей."
+            )
+        self._update_hint()
+
+    def _focus_control_sections(self, mode: str) -> None:
+        """Bring the settings for the selected preview into view."""
+        self.depth_section.set_expanded(mode == "Depth")
+        self.ao_section.set_expanded(mode in ("AO", "Lighting Preview"))
+        self.normal_section.set_expanded(mode in ("Normal", "Lighting Preview"))
+        self.crown_section.set_expanded(mode == "Маска кроны")
+        self.controls_scroll.verticalScrollBar().setValue(0)
+
+    def _update_hint(self) -> None:
+        if self.source is None:
+            text = "Откройте PNG или проект. Выберите карту в меню «Генерировать»."
+        elif self._selection_active:
+            text = "«Готово» применит маску, «Отмена» сохранит прежнее выделение."
+        else:
+            mode = self.mode.currentText()
+            if mode in ("Depth", "AO") and self.depth is None:
+                text = "Сначала создайте карту глубины в меню «Генерировать»."
+            elif mode in ("Normal", "Lighting Preview") and self.ai_vectors is None:
+                text = "Сначала создайте карту нормалей в меню «Генерировать»."
+            elif mode == "Albedo" and self.albedo is None:
+                text = "Создайте Albedo в меню «Генерировать». Сейчас показан исходник."
+            elif mode == "Lighting Preview":
+                text = "Перетаскивайте мышь по изображению, чтобы переместить свет. Колесо меняет масштаб."
+            elif mode == "Маска кроны":
+                text = "Определите крону и нажмите «Готово». Экспорт сохранит маску в проекте."
+            else:
+                text = "Колесо меняет масштаб. Перетаскивание перемещает изображение."
+        self.hint.setText(text)
 
     def open_file(self) -> None:
         last_directory = self._settings.value(self._last_open_directory_key, "", type=str)
@@ -498,7 +711,8 @@ class MainWindow(QMainWindow):
                 foliage_mask = None
             self.source_path = source_path
             self.source = source
-            self.editor = DepthEditor(depth, source[..., 3]) if depth is not None else None
+            self.base_depth = depth
+            self.depth = process_depth(depth, source[..., 3], DepthSettings()) if depth is not None else None
             self._preview_ao = None
             self._preview_normal = None
             self.ai_vectors = None
@@ -625,7 +839,7 @@ class MainWindow(QMainWindow):
     def generate_ao(self) -> None:
         if self.source is None or (self.worker is not None and self.worker.isRunning()):
             return
-        if self.editor is not None:
+        if self.depth is not None:
             self.mode.setCurrentText("AO")
             self._refresh()
             return
@@ -719,13 +933,14 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("AI Normal готова")
 
     def _generated(self, depth: np.ndarray) -> None:
-        self.editor = DepthEditor(depth, self.source[..., 3])
+        self.base_depth = np.asarray(depth, np.float32)
+        self.depth = process_depth(self.base_depth, self.source[..., 3], DepthSettings())
         self._preview_ao = None
         self._preview_normal = None
         self.mode.setCurrentText("AO" if self._show_ao_after_generation else "Depth")
         self._show_ao_after_generation = False
         self._settings_changed()
-        self.statusBar().showMessage("Depth готова. При необходимости поправьте кистью.")
+        self.statusBar().showMessage("Depth готова")
 
     def _generation_failed(self, message: str) -> None:
         self._show_ao_after_generation = False
@@ -786,11 +1001,11 @@ class MainWindow(QMainWindow):
         self._update_actions()
 
     def _settings_changed(self) -> None:
-        if self._building or self.editor is None:
+        if self._building or self.base_depth is None:
             return
         settings = DepthSettings(self.invert.isChecked(), self.depth_strength.value() / 100,
                                  self.contrast.value() / 100, self.smooth.value() / 10)
-        self.editor.set_settings(settings)
+        self.depth = process_depth(self.base_depth, self.source[..., 3], settings)
         self._preview_ao = None
         self._preview_normal = None
         self._refresh()
@@ -809,7 +1024,7 @@ class MainWindow(QMainWindow):
     def _selected_ao(self) -> np.ndarray:
         if self._preview_ao is None:
             self._preview_ao = ao_from_depth(
-                self.editor.depth, self.source[..., 3],
+                self.depth, self.source[..., 3],
                 self.ao_radius.value(), self.ao_strength.value(),
             )
         return self._preview_ao
@@ -841,11 +1056,9 @@ class MainWindow(QMainWindow):
 
     def _mode_changed(self, mode: str) -> None:
         self.view.mode = mode
+        self._focus_control_sections(mode)
+        self._update_hint()
         self._refresh()
-
-    def _tool_changed(self, tool: str) -> None:
-        self.view.tool = tool
-        self.view.setDragMode(ImageView.ScrollHandDrag if tool == "Pan" else ImageView.NoDrag)
 
     def _refresh(self, fit: bool = False) -> None:
         if self.source is None:
@@ -861,12 +1074,12 @@ class MainWindow(QMainWindow):
         elif mode == "Маска кроны":
             pixels = self._foliage_preview()
         elif mode in ("Depth", "AO"):
-            if self.editor is None:
+            if self.depth is None:
                 pixels = self.source
                 self.view.set_pixels(pixels, fit)
                 self._update_actions()
                 return
-            grey = np.rint((self.editor.depth if mode == "Depth" else self._selected_ao()) * 255).astype(np.uint8)
+            grey = np.rint((self.depth if mode == "Depth" else self._selected_ao()) * 255).astype(np.uint8)
             pixels = np.empty_like(self.source)
             pixels[..., :3] = grey[..., None]
             pixels[..., 3] = self.source[..., 3]
@@ -879,7 +1092,7 @@ class MainWindow(QMainWindow):
                 if self._preview_normal is None:
                     self._preview_normal = self._selected_normal("OpenGL")
                 lighting_base = self.albedo if self.albedo is not None else self.source
-                ao = self._selected_ao() if self.editor is not None else None
+                ao = self._selected_ao() if self.depth is not None else None
                 pixels = render_lighting(lighting_base, self._preview_normal, *self.light, ao)
         self.view.set_pixels(pixels, fit)
         self._update_actions()
@@ -902,37 +1115,9 @@ class MainWindow(QMainWindow):
         pixels[..., 3] = self.source[..., 3]
         return pixels
 
-    def _brush_event(self, phase: str, x: int, y: int) -> None:
-        if self.editor is None or (self.worker is not None and self.worker.isRunning()):
-            return
-        if phase == "begin":
-            if not (0 <= x < self.source.shape[1] and 0 <= y < self.source.shape[0]) or self.source[y, x, 3] == 0:
-                return
-            self.editor.begin(self.tool.currentText(), self.radius.value(),
-                              self.brush_strength.value() / 100, x, y)
-        elif phase == "move":
-            self.editor.move(x, y)
-        else:
-            self.editor.end()
-        self._preview_ao = None
-        self._preview_normal = None
-        self._refresh()
-
     def _light_changed(self, x: float, y: float) -> None:
         self.light = (max(-1, min(1, x)), max(-1, min(1, y)))
         if self.mode.currentText() == "Lighting Preview":
-            self._refresh()
-
-    def undo(self) -> None:
-        if self.editor and self.editor.undo():
-            self._preview_ao = None
-            self._preview_normal = None
-            self._refresh()
-
-    def redo(self) -> None:
-        if self.editor and self.editor.redo():
-            self._preview_ao = None
-            self._preview_normal = None
             self._refresh()
 
     def fit_image(self) -> None:
@@ -940,7 +1125,7 @@ class MainWindow(QMainWindow):
             self.view.fitInView(self.view.item, Qt.KeepAspectRatio)
 
     def export(self) -> None:
-        if self.editor is None and self.ai_vectors is None and self.albedo is None and self.foliage_mask is None:
+        if self.depth is None and self.ai_vectors is None and self.albedo is None and self.foliage_mask is None:
             return
         default_directory = Path.cwd() / "generated"
         default_directory.mkdir(parents=True, exist_ok=True)
@@ -949,15 +1134,15 @@ class MainWindow(QMainWindow):
             return
         try:
             saved = []
-            if self.editor is not None:
+            if self.depth is not None:
                 depth_path = export_depth(
-                    self.source_path, self.editor.depth, self.source[..., 3], directory
+                    self.source_path, self.depth, self.source[..., 3], directory
                 )
                 ao_path = export_ao(
                     self.source_path, self._selected_ao(), self.source[..., 3], directory
                 )
                 project_path = Path(directory) / f"{self.source_path.stem}.ssoul"
-                save_project(project_path, self.source_path, self.editor.depth,
+                save_project(project_path, self.source_path, self.depth,
                              20.0, self.convention.currentText(), self.foliage_mask)
                 saved.extend((depth_path.name, ao_path.name, project_path.name))
             elif self.foliage_mask is not None:

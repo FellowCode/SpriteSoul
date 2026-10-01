@@ -1,4 +1,4 @@
-"""Approximate ambient occlusion from an edited, normalized height/depth map."""
+"""Approximate ambient occlusion from a processed, normalized height/depth map."""
 
 import cv2
 import numpy as np
