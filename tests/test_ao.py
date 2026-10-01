@@ -81,7 +81,7 @@ def test_lighting_preview_recalculates_ao_when_strength_changes(monkeypatch):
     window.ai_vectors = np.zeros((33, 33, 3), np.float32)
     seen = []
 
-    def capture(base, normal, light_x, light_y, ao):
+    def capture(base, normal, light_x, light_y, ao, roughness=None):
         seen.append(ao.copy())
         return base
 

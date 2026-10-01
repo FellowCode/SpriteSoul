@@ -68,8 +68,8 @@ def _add_generate_args(parser: argparse.ArgumentParser) -> None:
                         help="исходные PNG или сохранённые проекты .ssoul")
     parser.add_argument("-o", "--output", default=Path("generated"), type=Path, metavar="DIR",
                         help="каталог для экспортируемых карт (по умолчанию: ./generated)")
-    parser.add_argument("--maps", choices=("both", "depth", "normal", "albedo", "ao", "all"), default="both",
-                        help="какие карты записать (по умолчанию: Depth и Normal; all — все четыре)")
+    parser.add_argument("--maps", choices=("both", "depth", "normal", "albedo", "ao", "roughness", "all"), default="both",
+                        help="какие карты записать (по умолчанию: Depth и Normal; all — все пять)")
     parser.add_argument("--depth-map", type=Path, metavar="PNG|DIR",
                         help="готовая Depth: PNG для одного входа или каталог с <имя>_depth.png для пакета")
     parser.add_argument("--normal-source", choices=("ai",), default="ai",
@@ -118,7 +118,7 @@ def _add_generate_args(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sprite-soul",
-        description="Генерация Depth, Normal, Albedo и AO; установка моделей без UI.",
+        description="Генерация Depth, Normal, Albedo, AO и Roughness; установка моделей без UI.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=("Примеры:\n"
                 "  sprite-soul setup --models all\n"
@@ -140,7 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Установить CUDA-сборку PyTorch и заранее скачать модели.",
         epilog="Пример: sprite-soul setup --models depth --progress json",
     )
-    setup.add_argument("--models", choices=("all", "depth", "ai", "clipseg", "albedo", "none"), default="all",
+    setup.add_argument("--models", choices=("all", "depth", "ai", "clipseg", "albedo", "roughness", "none"), default="all",
                        help="какие модели скачать (по умолчанию: all)")
     setup.add_argument("--skip-cuda", action="store_true",
                        help="скачать модели без проверки и установки CUDA")
@@ -151,7 +151,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _setup_command(args: argparse.Namespace, reporter: Reporter) -> int:
     from smg.setup import prepare_environment
 
-    models = ("depth", "ai", "clipseg", "albedo") if args.models == "all" else (() if args.models == "none" else (args.models,))
+    models = ("depth", "ai", "clipseg", "albedo", "roughness") if args.models == "all" else (() if args.models == "none" else (args.models,))
     try:
         prepare_environment(models, reporter.text, install_cuda=not args.skip_cuda,
                             events=reporter.emit)
@@ -174,7 +174,8 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
     from smg.albedo_ai import generate_albedo
     from smg.crown_normal import compose_crown_normals
     from smg.depth.processing import DepthSettings, process_depth
-    from smg.export import export_albedo, export_ao, export_depth, export_normal, load_project, save_project
+    from smg.export import export_albedo, export_ao, export_depth, export_normal, export_roughness, load_project, save_project
+    from smg.roughness_ai import generate_roughness
     from smg.normal import ai_normal, orient_ai_vectors, postprocess_ai_vectors
     from smg.normal_ai import DSINENormalModel
     from smg.pipeline import generate_depth, open_depth_png, open_png
@@ -199,6 +200,7 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
     wants_normal = args.maps in ("both", "normal", "all")
     wants_albedo = args.maps in ("albedo", "all")
     wants_ao = args.maps in ("ao", "all")
+    wants_roughness = args.maps in ("roughness", "all")
     needs_depth = wants_depth or wants_ao or args.save_project
     paths = []
     if wants_depth:
@@ -209,6 +211,8 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
         paths.append(output / f"{stem}_albedo.png")
     if wants_ao:
         paths.append(output / f"{stem}_ao.png")
+    if wants_roughness:
+        paths.append(output / f"{stem}_roughness.png")
     if args.save_project:
         paths.append(output / f"{stem}.ssoul")
     for target in paths:
@@ -231,6 +235,8 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
             models.append("clipseg")
     if wants_albedo:
         models.append("albedo")
+    if wants_roughness:
+        models.append("roughness")
     if models:
         prepare_environment(models, reporter.text, events=reporter.emit)
 
@@ -279,6 +285,10 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
             debug=args.albedo_debug is not None, debug_dir=args.albedo_debug,
         )
         export_albedo(source_path, albedo, output)
+    if wants_roughness:
+        progress("Генерация Roughness...")
+        roughness = generate_roughness(rgba, progress)
+        export_roughness(source_path, roughness, rgba[..., 3], output)
     if args.save_project:
         output.mkdir(parents=True, exist_ok=True)
         save_project(output / f"{stem}.ssoul", source_path, depth,

@@ -12,9 +12,10 @@ from PySide6.QtWidgets import (
 from smg.depth.inference import DepthModel
 from smg.ao import ao_from_depth
 from smg.albedo_ai import generate_albedo
+from smg.roughness_ai import generate_roughness
 from smg.crown_normal import compose_crown_normals
 from smg.depth.processing import DepthSettings, process_depth
-from smg.export import export_albedo, export_ao, export_depth, export_normal, load_project, save_project
+from smg.export import export_albedo, export_ao, export_depth, export_normal, export_roughness, load_project, save_project
 from smg.normal import ai_normal, orient_ai_vectors, postprocess_ai_vectors
 from smg.normal_ai import DSINENormalModel
 from smg.pipeline import generate_depth, open_png
@@ -23,6 +24,7 @@ from smg.setup import MODEL_LABELS, missing_models, prepare_environment
 from smg.ui.control_section import ControlSection, FocusWheelGuard
 from smg.ui.image_view import ImageView
 from smg.ui.lighting_preview import render_lighting
+from smg.ui.setup_dialog import SetupProgressDialog
 
 
 class GenerateThread(QThread):
@@ -79,7 +81,7 @@ class SetupThread(QThread):
     def run(self) -> None:
         try:
             prepare_environment(
-                ("depth", "ai", "clipseg"), self.progress.emit, events=self.progress_event.emit
+                ("depth", "ai", "clipseg", "roughness"), self.progress.emit, events=self.progress_event.emit
             )
             self.prepared.emit()
         except Exception as exc:
@@ -127,10 +129,29 @@ class GenerateAlbedoThread(QThread):
             self.failed.emit(str(exc))
 
 
+class GenerateRoughnessThread(QThread):
+    generated = Signal(object)
+    failed = Signal(str)
+    progress = Signal(str)
+    progress_event = Signal(object)
+
+    def __init__(self, rgba: np.ndarray, parent=None):
+        super().__init__(parent)
+        self.rgba = rgba.copy()
+
+    def run(self) -> None:
+        try:
+            prepare_environment(("roughness",), self.progress.emit, events=self.progress_event.emit)
+            self.generated.emit(generate_roughness(self.rgba, self.progress.emit))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class GenerateAllThread(QThread):
     depth_generated = Signal(object)
     normal_generated = Signal(object)
     albedo_generated = Signal(object)
+    roughness_generated = Signal(object)
     completed = Signal()
     failed = Signal(str)
     progress = Signal(str)
@@ -145,7 +166,7 @@ class GenerateAllThread(QThread):
 
     def run(self) -> None:
         try:
-            models = ("depth", "ai", "albedo")
+            models = ("depth", "ai", "albedo", "roughness")
             if self.foliage_mask is None:
                 models += ("clipseg",)
             prepare_environment(
@@ -165,6 +186,8 @@ class GenerateAllThread(QThread):
             )
             self.progress.emit("Генерация Albedo...")
             self.albedo_generated.emit(generate_albedo(self.rgba, self.progress.emit))
+            self.progress.emit("Генерация карты шероховатости...")
+            self.roughness_generated.emit(generate_roughness(self.rgba, self.progress.emit))
             self.completed.emit()
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -189,7 +212,9 @@ class MainWindow(QMainWindow):
         self._preview_normal: np.ndarray | None = None
         self.ai_vectors: np.ndarray | None = None  # OpenGL float XYZ, converted at inference time
         self.albedo: np.ndarray | None = None
+        self.roughness: np.ndarray | None = None
         self.worker: QThread | None = None
+        self.setup_dialog: SetupProgressDialog | None = None
         self.foliage_mask: np.ndarray | None = None
         self._selection_scores: np.ndarray | None = None
         self._selection_mask: np.ndarray | None = None
@@ -226,6 +251,9 @@ class MainWindow(QMainWindow):
         self.generate_albedo_action = self._action(
             "Albedo", "Ctrl+Shift+A", self.generate_albedo
         )
+        self.generate_roughness_action = self._action(
+            "Карта шероховатости", "Ctrl+Shift+R", self.generate_roughness
+        )
         self.generate_all_action = self._action(
             "Все карты", "Ctrl+Alt+G", self.generate_all
         )
@@ -238,7 +266,7 @@ class MainWindow(QMainWindow):
         self.generate_menu = self.menuBar().addMenu("Генерировать")
         for action in (
             self.generate_depth_action, self.generate_ao_action, self.generate_normal_action,
-            self.generate_albedo_action, self.generate_all_action,
+            self.generate_albedo_action, self.generate_roughness_action, self.generate_all_action,
         ):
             self.generate_menu.addAction(action)
         self.export_action = self._action("Экспорт", "Ctrl+E", self.export)
@@ -277,7 +305,7 @@ class MainWindow(QMainWindow):
         preview_layout.addWidget(title)
         preview_layout.addWidget(QLabel("Просмотр карты"))
         self.mode = QComboBox()
-        self.mode.addItems(("Source", "Albedo", "Depth", "AO", "Normal", "Lighting Preview", "Маска кроны"))
+        self.mode.addItems(("Source", "Albedo", "Depth", "AO", "Normal", "Roughness", "Lighting Preview", "Маска кроны"))
         self.mode.setAccessibleName("Просмотр карты")
         self.mode.currentTextChanged.connect(self._mode_changed)
         preview_layout.addWidget(self.mode)
@@ -621,6 +649,7 @@ class MainWindow(QMainWindow):
         self.generate_ao_action.setEnabled(ready and not busy and not selecting)
         self.generate_normal_action.setEnabled(ready and not busy and not selecting)
         self.generate_albedo_action.setEnabled(ready and not busy and not selecting)
+        self.generate_roughness_action.setEnabled(ready and not busy and not selecting)
         self.generate_all_action.setEnabled(ready and not busy and not selecting)
         self.select_foliage_action.setEnabled(ready and not busy and not selecting)
         self.generate_menu.menuAction().setEnabled(ready and not busy and not selecting)
@@ -630,7 +659,7 @@ class MainWindow(QMainWindow):
         self.ai_details.setEnabled(not busy and not selecting)
         self.export_action.setEnabled(
             (self.depth is not None or self.ai_vectors is not None or self.albedo is not None
-             or self.foliage_mask is not None) and not busy and not selecting
+             or self.roughness is not None or self.foliage_mask is not None) and not busy and not selecting
         )
         controls_enabled = selecting and self._selection_scores is not None and not self._selection_pending
         self.selection_threshold.setEnabled(controls_enabled)
@@ -680,6 +709,10 @@ class MainWindow(QMainWindow):
                 text = "Сначала создайте карту нормалей в меню «Генерировать»."
             elif mode == "Albedo" and self.albedo is None:
                 text = "Создайте Albedo в меню «Генерировать». Сейчас показан исходник."
+            elif mode == "Roughness":
+                text = ("Создайте карту шероховатости в меню «Генерировать». Сейчас показан исходник."
+                        if self.roughness is None else
+                        "Чёрный — гладкая поверхность, белый — шероховатая. Экспорт сохранит Roughness PNG.")
             elif mode == "Lighting Preview":
                 text = "Перетаскивайте мышь по изображению, чтобы переместить свет. Колесо меняет масштаб."
             elif mode == "Маска кроны":
@@ -717,6 +750,7 @@ class MainWindow(QMainWindow):
             self._preview_normal = None
             self.ai_vectors = None
             self.albedo = None
+            self.roughness = None
             self.foliage_mask = foliage_mask
             self._selection_scores = None
             self._selection_mask = None
@@ -848,16 +882,30 @@ class MainWindow(QMainWindow):
     def prepare_ai(self) -> None:
         if self.worker is not None and self.worker.isRunning():
             return
+        if self.setup_dialog is not None:
+            self.setup_dialog.raise_()
+            self.setup_dialog.activateWindow()
+            return
+        self.setup_dialog = SetupProgressDialog(self)
+        self.setup_dialog.finished.connect(self._setup_dialog_closed)
         self.worker = SetupThread(self)
         self._connect_worker_progress(self.worker)
+        self.worker.progress_event.connect(self.setup_dialog.update_progress)
+        self.worker.prepared.connect(self.setup_dialog.show_success)
         self.worker.prepared.connect(lambda: self.statusBar().showMessage("CUDA и модели готовы"))
         self.worker.failed.connect(self._setup_failed)
+        self.worker.finished.connect(self.setup_dialog.finish)
         self.worker.finished.connect(self._generation_finished)
+        self.setup_dialog.open()
         self.worker.start()
         self._update_actions()
 
+    def _setup_dialog_closed(self) -> None:
+        self.setup_dialog.deleteLater()
+        self.setup_dialog = None
+
     def _setup_failed(self, message: str) -> None:
-        QMessageBox.critical(self, "Ошибка подготовки AI", message)
+        self.setup_dialog.show_failure(message)
         self.statusBar().showMessage("Подготовка AI не удалась")
 
     def generate_ai_normal(self) -> None:
@@ -889,10 +937,23 @@ class MainWindow(QMainWindow):
         self.worker.start()
         self._update_actions()
 
+    def generate_roughness(self) -> None:
+        if self.source is None or (self.worker is not None and self.worker.isRunning()):
+            return
+        if not self._confirm_model_download(("roughness",)):
+            return
+        self.worker = GenerateRoughnessThread(self.source, self)
+        self._connect_worker_progress(self.worker)
+        self.worker.generated.connect(self._roughness_generated)
+        self.worker.failed.connect(self._generation_failed)
+        self.worker.finished.connect(self._generation_finished)
+        self.worker.start()
+        self._update_actions()
+
     def generate_all(self) -> None:
         if self.source is None or (self.worker is not None and self.worker.isRunning()):
             return
-        models = ("depth", "ai", "albedo")
+        models = ("depth", "ai", "albedo", "roughness")
         if self.foliage_mask is None:
             models += ("clipseg",)
         if not self._confirm_model_download(models):
@@ -904,6 +965,7 @@ class MainWindow(QMainWindow):
         self.worker.depth_generated.connect(self._generated)
         self.worker.normal_generated.connect(self._ai_generated)
         self.worker.albedo_generated.connect(self._albedo_generated)
+        self.worker.roughness_generated.connect(self._roughness_generated)
         self.worker.completed.connect(self._all_generated)
         self.worker.failed.connect(self._generation_failed)
         self.worker.finished.connect(self._generation_finished)
@@ -912,6 +974,15 @@ class MainWindow(QMainWindow):
 
     def _all_generated(self) -> None:
         self.statusBar().showMessage("Все карты готовы")
+
+    def _roughness_generated(self, roughness: np.ndarray) -> None:
+        if roughness.shape != self.source.shape[:2] or not np.isfinite(roughness).all():
+            self._generation_failed("SuperMat вернула неверную карту Roughness")
+            return
+        self.roughness = np.clip(roughness, 0, 1).astype(np.float32)
+        self.mode.setCurrentText("Roughness")
+        self._refresh()
+        self.statusBar().showMessage("Карта шероховатости готова")
 
     def _albedo_generated(self, albedo: np.ndarray) -> None:
         self.albedo = albedo
@@ -955,6 +1026,8 @@ class MainWindow(QMainWindow):
         note = ""
         if "albedo" in missing:
             note = "\n\nВес IntrinsicAnything составляет около 14,4 ГиБ."
+        if "roughness" in missing:
+            note += "\n\nSuperMat и необходимые компоненты занимают около 4,1 ГиБ."
         answer = QMessageBox.question(
             self,
             "Требуется загрузка модели",
@@ -983,14 +1056,15 @@ class MainWindow(QMainWindow):
             self.download_progress.setRange(0, 0)
             self.download_progress.setFormat("Загрузка…")
         elif isinstance(current, int) and isinstance(total, int) and total > 0:
-            self.download_progress.setRange(0, total)
-            self.download_progress.setValue(min(current, total))
+            maximum = 1000 if event.get("unit") == "bytes" else total
+            self.download_progress.setRange(0, maximum)
+            self.download_progress.setValue(min(maximum, int(current / total * maximum)))
             self.download_progress.setFormat("%p%")
         else:
             self.download_progress.setRange(0, 0)
             self.download_progress.setFormat("Загрузка…")
         if status in {"done", "cached", "ready"} and current == total and total is not None:
-            self.download_progress.setValue(total)
+            self.download_progress.setValue(self.download_progress.maximum())
 
     def _generation_finished(self) -> None:
         self.download_progress.hide()
@@ -1067,6 +1141,12 @@ class MainWindow(QMainWindow):
         mode = self.mode.currentText()
         if mode == "Albedo":
             pixels = self.albedo if self.albedo is not None else self.source
+        elif mode == "Roughness":
+            pixels = self.source
+            if self.roughness is not None:
+                grey = np.rint(self.roughness * 255).astype(np.uint8)
+                pixels = self.source.copy()
+                pixels[..., :3] = grey[..., None]
         elif mode == "Source":
             pixels = self._foliage_overlay(self.source, self._selection_mask) if (
                 self._selection_active and self._selection_mask is not None
@@ -1093,7 +1173,10 @@ class MainWindow(QMainWindow):
                     self._preview_normal = self._selected_normal("OpenGL")
                 lighting_base = self.albedo if self.albedo is not None else self.source
                 ao = self._selected_ao() if self.depth is not None else None
-                pixels = render_lighting(lighting_base, self._preview_normal, *self.light, ao)
+                pixels = render_lighting(
+                    lighting_base, self._preview_normal, *self.light,
+                    ao=ao, roughness=self.roughness,
+                )
         self.view.set_pixels(pixels, fit)
         self._update_actions()
 
@@ -1125,7 +1208,8 @@ class MainWindow(QMainWindow):
             self.view.fitInView(self.view.item, Qt.KeepAspectRatio)
 
     def export(self) -> None:
-        if self.depth is None and self.ai_vectors is None and self.albedo is None and self.foliage_mask is None:
+        if (self.depth is None and self.ai_vectors is None and self.albedo is None
+                and self.roughness is None and self.foliage_mask is None):
             return
         default_directory = Path.cwd() / "generated"
         default_directory.mkdir(parents=True, exist_ok=True)
@@ -1157,6 +1241,11 @@ class MainWindow(QMainWindow):
             if self.albedo is not None:
                 albedo_path = export_albedo(self.source_path, self.albedo, directory)
                 saved.append(albedo_path.name)
+            if self.roughness is not None:
+                roughness_path = export_roughness(
+                    self.source_path, self.roughness, self.source[..., 3], directory,
+                )
+                saved.append(roughness_path.name)
             self.statusBar().showMessage("Сохранено: " + ", ".join(saved))
         except Exception as exc:
             QMessageBox.critical(self, "Ошибка экспорта", str(exc))

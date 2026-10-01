@@ -63,6 +63,22 @@ def export_ao(source_path: str | Path, ao: np.ndarray, alpha: np.ndarray,
     return ao_path
 
 
+def export_roughness(source_path: str | Path, roughness: np.ndarray, alpha: np.ndarray,
+                     directory: str | Path) -> Path:
+    """Save linear roughness in RGB (black = smooth, white = rough), original alpha."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{Path(source_path).stem}_roughness.png"
+    if roughness.shape != alpha.shape or not np.isfinite(roughness).all():
+        raise ValueError("Некорректный размер или значения Roughness")
+    grey = np.rint(np.clip(roughness, 0, 1) * 255).astype(np.uint8)
+    rgba = np.empty((*grey.shape, 4), np.uint8)
+    rgba[..., :3] = grey[..., None]
+    rgba[..., 3] = alpha
+    Image.fromarray(rgba).save(path)
+    return path
+
+
 def _validated_foliage_mask(foliage_mask: np.ndarray | None,
                             shape: tuple[int, int] | None = None) -> np.ndarray | None:
     if foliage_mask is None:

@@ -88,7 +88,7 @@ def test_setup_cli_all_includes_every_model(monkeypatch):
     monkeypatch.setattr(setup, "prepare_environment", lambda models, progress, install_cuda, events=None:
                         calls.append(models))
     assert main(["setup", "--models", "all", "--skip-cuda"]) == 0
-    assert calls == [("depth", "ai", "clipseg", "albedo")]
+    assert calls == [("depth", "ai", "clipseg", "albedo", "roughness")]
 
 
 def test_setup_cli_accepts_albedo(monkeypatch):

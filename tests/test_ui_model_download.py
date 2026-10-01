@@ -54,7 +54,7 @@ def test_generate_menu_groups_all_map_actions():
     window = main_window.MainWindow()
     assert window.generate_menu.title() == "Генерировать"
     assert [action.text() for action in window.generate_menu.actions()] == [
-        "Карта глубины", "Карта AO", "Карта нормалей", "Albedo", "Все карты",
+        "Карта глубины", "Карта AO", "Карта нормалей", "Albedo", "Карта шероховатости", "Все карты",
     ]
     assert not hasattr(window, "normal_source")
     assert window.ai_smoothing.value() == 1.5
@@ -94,7 +94,7 @@ def test_lighting_preview_prefers_albedo_and_falls_back_to_source(monkeypatch):
     window.mode.blockSignals(False)
     bases = []
 
-    def fake_render(base, normal, light_x, light_y, ao=None):
+    def fake_render(base, normal, light_x, light_y, ao=None, roughness=None):
         bases.append(base)
         return base
 
@@ -261,6 +261,8 @@ def test_generate_all_worker_detects_crown(monkeypatch):
     monkeypatch.setattr(main_window, "generate_depth",
                         lambda rgba, model, progress: np.zeros(rgba.shape[:2], np.float32))
     monkeypatch.setattr(main_window, "generate_albedo", lambda rgba, progress: rgba)
+    monkeypatch.setattr(main_window, "generate_roughness",
+                        lambda rgba, progress: np.full(rgba.shape[:2], 0.5, np.float32))
     monkeypatch.setattr(main_window, "detect_tree_crown",
                         lambda rgba, progress: np.ones(rgba.shape[:2], bool))
 
@@ -276,8 +278,11 @@ def test_generate_all_worker_detects_crown(monkeypatch):
     results = []
     failures = []
     worker.normal_generated.connect(results.append)
+    roughness_results = []
+    worker.roughness_generated.connect(roughness_results.append)
     worker.failed.connect(failures.append)
     worker.run()
     assert failures == []
-    assert prepared == [("depth", "ai", "albedo", "clipseg")]
+    assert prepared == [("depth", "ai", "albedo", "roughness", "clipseg")]
     assert results[0][1].all()
+    assert roughness_results[0].shape == (4, 5)

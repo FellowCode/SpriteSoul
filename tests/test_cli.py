@@ -179,12 +179,13 @@ def test_cli_rejects_irrelevant_or_unmatched_depth_map(tmp_path):
     ("normal", ("ai", "clipseg"), {"normal"}),
     ("albedo", ("albedo",), {"albedo"}),
     ("ao", ("depth",), {"ao"}),
-    ("all", ("depth", "ai", "clipseg", "albedo"),
-     {"depth", "normal", "albedo", "ao"}),
+    ("roughness", ("roughness",), {"roughness"}),
+    ("all", ("depth", "ai", "clipseg", "albedo", "roughness"),
+     {"depth", "normal", "albedo", "ao", "roughness"}),
 ])
 def test_cli_generates_selected_maps(tmp_path, monkeypatch, mode, expected_models,
                                      expected_suffixes, project_args):
-    from smg import albedo_ai, export, normal_ai, segmentation, setup
+    from smg import albedo_ai, export, normal_ai, roughness_ai, segmentation, setup
     from smg.depth import inference
 
     prepared = []
@@ -208,6 +209,8 @@ def test_cli_generates_selected_maps(tmp_path, monkeypatch, mode, expected_model
     monkeypatch.setattr(normal_ai, "DSINENormalModel", FakeNormal)
     monkeypatch.setattr(segmentation, "detect_tree_crown", lambda rgba, progress: None)
     monkeypatch.setattr(albedo_ai, "generate_albedo", lambda rgba, progress, **kwargs: rgba.copy())
+    monkeypatch.setattr(roughness_ai, "generate_roughness",
+                        lambda rgba, progress: np.full(rgba.shape[:2], 0.5, np.float32))
 
     def unexpected_save(*args, **kwargs):
         raise AssertionError("Direct export must not save a project")

@@ -1,4 +1,4 @@
-"""Prepare the CUDA PyTorch runtime and cache the two inference models."""
+"""Prepare CUDA PyTorch and cache the selected inference models."""
 
 import io
 import json
@@ -31,6 +31,7 @@ MODEL_LABELS = {
     "ai": "DSINE",
     "albedo": "IntrinsicAnything (Albedo)",
     "clipseg": "CLIPSeg (определение кроны)",
+    "roughness": "SuperMat (шероховатость)",
 }
 _PIP_BYTES = re.compile(r"(?P<current>\d+(?:\.\d+)?)/(?P<total>\d+(?:\.\d+)?) (?P<unit>kB|MB|GB)")
 _PIP_UNITS = {"kB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3}
@@ -51,6 +52,9 @@ def _cached_model_file(repo: str, filename: str) -> bool:
 
 def model_available(model: str) -> bool:
     """Return whether a model can be used without downloading anything."""
+    if model == "roughness":
+        from smg.roughness_ai import model_available as supermat_available
+        return supermat_available()
     if model == "depth":
         return all(_cached_model_file(MODEL_ID, filename) for filename in (
             "config.json", "preprocessor_config.json", "model.safetensors"
@@ -389,9 +393,9 @@ def prepare_environment(models: Iterable[str] = ("depth", "ai"), progress: Progr
     """Install CUDA PyTorch when needed, then cache exactly the files inference uses."""
     report = progress or (lambda _message: None)
     selected = set(models)
-    if selected - {"depth", "ai", "albedo", "clipseg"}:
+    if selected - {"depth", "ai", "albedo", "clipseg", "roughness"}:
         raise ValueError("Неизвестная модель для загрузки")
-    if install_cuda and selected & {"depth", "ai", "clipseg"}:
+    if install_cuda and selected & {"depth", "ai", "clipseg", "roughness"}:
         ensure_cuda(report, events)
     if "depth" in selected:
         files = ("config.json", "preprocessor_config.json", "model.safetensors")
@@ -438,5 +442,8 @@ def prepare_environment(models: Iterable[str] = ("depth", "ai"), progress: Progr
             _emit(events, "model_download", "cached" if cached else "done", message,
                   model="clipseg", file=filename, current=index,
                   total=len(CLIPSEG_FILES), unit="files")
+    if "roughness" in selected:
+        from smg.supermat_setup import prepare_supermat
+        prepare_supermat(report, events)
     report("Подготовка завершена")
     _emit(events, "setup", "done", "Подготовка завершена")

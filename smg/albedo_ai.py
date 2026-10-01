@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 import cv2
@@ -15,6 +16,36 @@ from smg.model_paths import INTRINSIC_ROOT
 
 
 DEFAULT_INTRINSIC_ROOT = INTRINSIC_ROOT
+
+
+def _run_intrinsic(command: list[str], root: Path) -> None:
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    logs = Path.cwd() / "generated" / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    log_path = logs / f"intrinsic-{uuid.uuid4().hex}.log"
+    with log_path.open("w", encoding="utf-8") as log:
+        result = subprocess.run(
+            command, cwd=root, stdout=log, stderr=subprocess.STDOUT, env=env,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+    if result.returncode:
+        details = log_path.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+        code = result.returncode & 0xFFFFFFFF
+        explanation = ""
+        if code == 0xC0000005:
+            explanation = " Сбой доступа к памяти Windows (access violation)."
+        elif code in (0xC0000017, 0xC000012D) or any(
+            marker in line.lower() for line in details
+            for marker in ("not enough memory", "paging file is too small", "defaultcpuallocator")
+        ):
+            explanation = " Недостаточно системной памяти для загрузки модели."
+        elif any("cuda out of memory" in line.lower() for line in details):
+            explanation = " Недостаточно видеопамяти."
+        raise RuntimeError(
+            f"IntrinsicAnything завершился с ошибкой (код 0x{code:08X}).{explanation}\n"
+            f"Полный журнал: {log_path}\n" + "\n".join(details[-10:])
+        )
 
 
 def _enable_low_vram(root: Path) -> None:
@@ -97,15 +128,13 @@ def generate_albedo(rgba: np.ndarray, progress=None, strength: float = 1.0,
             Image.fromarray(image).save(input_dir / f"sprite_{index:04d}.png")
         if progress:
             progress("Генерация Albedo...")
-        command = [str(python), str(root / "inference.py"), "--input_dir", str(input_dir),
+        worker = Path(__file__).with_name("intrinsic_worker.py")
+        command = [str(python), "-u", "-X", "faulthandler", str(worker), str(root),
+                   "--input_dir", str(input_dir),
                    "--output_dir", str(output_dir), "--model_dir", str(root / "weights/albedo"),
                    "--ddim", "100", "--batch_size", "1", "--splits_vertical", "1",
                    "--splits_horizontal", "1"]
-        result = subprocess.run(command, cwd=root, capture_output=True, text=True, errors="replace",
-                                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
-        if result.returncode:
-            details = (result.stderr or result.stdout).strip().splitlines()
-            raise RuntimeError("IntrinsicAnything завершился с ошибкой: " + " | ".join(details[-6:]))
+        _run_intrinsic(command, root)
         for index, region in enumerate(regions):
             path = output_dir / f"sprite_{index:04d}.png"
             if not path.is_file():

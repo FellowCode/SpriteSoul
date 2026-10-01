@@ -1,6 +1,6 @@
 # Sprite Soul CLI
 
-`--maps all` создаёт Depth, Normal, Albedo и AO за один запуск. `--maps depth|normal|albedo|ao` создаёт одну выбранную карту; `both` оставлен для Depth и Normal и используется по умолчанию. AO рассчитывается из Depth. Если Depth уже готова, передайте `--depth-map карта.png`, каталог карт для пакета или откройте `.ssoul`: нейромодель глубины повторно не запускается. CLI не предоставляет кисть для ручного редактирования Depth.
+`--maps all` создаёт Depth, Normal, Albedo, AO и Roughness за один запуск. `--maps depth|normal|albedo|ao|roughness` создаёт одну выбранную карту; `both` оставлен для Depth и Normal и используется по умолчанию. AO рассчитывается из Depth. Если Depth уже готова, передайте `--depth-map карта.png`, каталог карт для пакета или откройте `.ssoul`: нейромодель глубины повторно не запускается. Roughness создаётся SuperMat независимо от остальных карт.
 
 CLI генерирует карты из PNG без запуска графического интерфейса. После установки из корня проекта:
 
@@ -17,7 +17,7 @@ py -3.11 -m venv .venv
 ## Подготовка моделей
 
 ```powershell
-# Проверить CUDA и скачать Depth, DSINE, CLIPSeg и IntrinsicAnything
+# Проверить CUDA и скачать Depth, DSINE, CLIPSeg, IntrinsicAnything и SuperMat
 .\.venv\Scripts\sprite-soul.exe setup
 
 # Читать события установки как JSON Lines
@@ -34,6 +34,9 @@ py -3.11 -m venv .venv
 
 # Подготовить только IntrinsicAnything для Albedo
 .\.venv\Scripts\sprite-soul.exe setup --models albedo
+
+# Подготовить SuperMat для Roughness
+.\.venv\Scripts\sprite-soul.exe setup --models roughness
 
 # Только установить CUDA-сборку PyTorch
 .\.venv\Scripts\sprite-soul.exe setup --models none
@@ -54,14 +57,17 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\sprite-soul.exe generate sprite.png --maps all -o exported --no-save-project
 ```
 
-Команда сразу записывает `sprite_depth.png`, `sprite_normal.png`, `sprite_albedo.png` и `sprite_ao.png` в `exported/`. `.ssoul` не создаётся; промежуточная Depth и маска кроны остаются в памяти до завершения обработки. `--no-save-project` явно выключает сохранение проекта; это также поведение по умолчанию. Для одной карты замените `all` на `depth`, `normal`, `albedo` или `ao`. Отдельная команда экспорта не требуется.
+Команда сразу записывает `sprite_depth.png`, `sprite_normal.png`, `sprite_albedo.png`, `sprite_ao.png` и `sprite_roughness.png` в `exported/`. `.ssoul` не создаётся; промежуточная Depth и маска кроны остаются в памяти до завершения обработки. `--no-save-project` явно выключает сохранение проекта; это также поведение по умолчанию. Для одной карты замените `all` на `depth`, `normal`, `albedo`, `ao` или `roughness`. Отдельная команда экспорта не требуется.
 
 ```powershell
 # Depth Anything V2 и DSINE: Depth и Normal
 .\.venv\Scripts\sprite-soul.exe generate .\assets\tree.png
 
-# Все четыре карты за один запуск
+# Все пять карт за один запуск
 .\.venv\Scripts\sprite-soul.exe generate .\assets\tree.png --maps all
+
+# Только Roughness; SuperMat без Depth, DSINE и IntrinsicAnything
+.\.venv\Scripts\sprite-soul.exe generate .\assets\tree.png --maps roughness
 
 # Только AO; можно добавить --depth-map для пропуска Depth AI
 .\.venv\Scripts\sprite-soul.exe generate .\assets\tree.png --maps ao --ao-radius 32 --ao-strength 1.5
@@ -149,7 +155,7 @@ Depth PNG сохраняется в 16-битном RGBA: одинаковое �
 
 | Параметр | Назначение | Значение по умолчанию |
 | --- | --- | --- |
-| `--maps both\|depth\|normal\|albedo\|ao\|all` | Какие карты записывать | `both` |
+| `--maps both\|depth\|normal\|albedo\|ao\|roughness\|all` | Какие карты записывать | `both` |
 | `--depth-map PNG\|DIR` | Готовая Depth для AO/Depth: один PNG или каталог карт для пакета | не задана |
 | `--normal-source ai` | Источник Normal; поддерживается только DSINE | `ai` |
 | `--convention opengl\|directx` | Конвенция Normal | `opengl` |
@@ -176,5 +182,7 @@ Depth PNG сохраняется в 16-битном RGBA: одинаковое �
 | `--quiet` | Синоним `--progress none` | выключено |
 
 `--maps normal` запускает только DSINE и не загружает Depth Anything V2. `--save-project` требует глубину. `--maps depth` не запускает DSINE. Флаги инверсии, `--ai-smoothing` и `--ai-details` влияют на итоговые нормали так же, как настройки UI. Детализация использует только высокочастотную яркость исходного изображения, сохраняя крупные наклоны DSINE; значение `0` полностью отключает этот этап.
+
+`--maps roughness` подготавливает только SuperMat (около 4,1 ГиБ весов и базовых компонентов) и CUDA. Инференс выполняется в отдельном процессе, в 512×512, за один шаг FP16. Результат — `<имя>_roughness.png` в 8-битном RGBA с исходным размером и alpha. Чёрный = гладкая поверхность, белый = шероховатая. Импортируйте карту как линейные данные без sRGB. Atlas обрабатывается целиком; мелкие детали могут сглаживаться. Roughness экспортируется в PNG и не сохраняется в `.ssoul`.
 
 В текстовом режиме прогресс и ошибки идут в stderr, имена записанных файлов — в stdout. Код выхода: `0` — все входы обработаны, `1` — ошибка хотя бы одного входа, `2` — неверные аргументы, `130` — прерывание Ctrl+C. Синтаксические ошибки аргументов выводятся текстом до выбора режима прогресса.
