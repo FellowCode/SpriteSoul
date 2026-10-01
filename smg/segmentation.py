@@ -172,50 +172,67 @@ def detect_tree_crown(rgba: np.ndarray, progress=None,
 
 def predict_crown_scores(rgba: np.ndarray, progress=None) -> np.ndarray:
     """Return CLIPSeg probabilities at the original sprite resolution."""
-    if rgba.ndim != 3 or rgba.shape[-1] != 4 or rgba.dtype != np.uint8:
-        raise ValueError("CLIPSeg ожидает RGBA uint8")
-
-    import torch
-    import torch.nn.functional as F
-    from transformers import CLIPSegForImageSegmentation, CLIPSegProcessor
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("Для CLIPSeg нужна NVIDIA CUDA")
-
-    model = None
+    model = CrownModel()
     try:
-        if progress:
-            progress("Загрузка CLIPSeg...")
-        processor = CLIPSegProcessor.from_pretrained(
-            MODEL_ID, cache_dir=HUGGINGFACE_HUB_CACHE, local_files_only=True,
-            use_fast=False,
-        )
-        model = CLIPSegForImageSegmentation.from_pretrained(
-            MODEL_ID, cache_dir=HUGGINGFACE_HUB_CACHE, local_files_only=True,
-            use_safetensors=True,
-        ).to("cuda").eval()
-
-        alpha = rgba[..., 3:4].astype(np.float32) / 255
-        rgb = np.rint(rgba[..., :3] * alpha + 127 * (1 - alpha)).astype(np.uint8)
-        inputs = processor(
-            text=[CROWN_PROMPT], images=[Image.fromarray(rgb)],
-            return_tensors="pt",
-        ).to("cuda")
-        if progress:
-            progress("CLIPSeg определяет крону...")
-        with torch.inference_mode():
-            logits = model(**inputs).logits.unsqueeze(1)
-            logits = F.interpolate(
-                logits.float(), size=rgba.shape[:2], mode="bilinear",
-                align_corners=False,
-            )
-            scores = logits.sigmoid()[0, 0].cpu().numpy().astype(np.float32)
-        if scores.shape != rgba.shape[:2]:
-            raise RuntimeError("CLIPSeg вернула карту неверного размера")
-        return scores
-    except torch.OutOfMemoryError as exc:
-        raise RuntimeError("Недостаточно VRAM для CLIPSeg. Закройте другие GPU-приложения.") from exc
+        return model.predict(rgba, progress)
     finally:
-        del model
+        model.unload()
+
+
+class CrownModel:
+    """Reusable CLIPSeg session for a CLI batch; unloaded explicitly between stages."""
+
+    def __init__(self):
+        self.model = None
+        self.processor = None
+
+    def unload(self):
+        if self.model is None and self.processor is None:
+            return
+        import torch
+
+        self.model = None
+        self.processor = None
         gc.collect()
         torch.cuda.empty_cache()
+
+    def predict(self, rgba: np.ndarray, progress=None) -> np.ndarray:
+        if rgba.ndim != 3 or rgba.shape[-1] != 4 or rgba.dtype != np.uint8:
+            raise ValueError("CLIPSeg ожидает RGBA uint8")
+        import torch
+        import torch.nn.functional as F
+        from transformers import CLIPSegForImageSegmentation, CLIPSegProcessor
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("Для CLIPSeg нужна NVIDIA CUDA")
+        try:
+            if self.model is None:
+                if progress:
+                    progress("Загрузка CLIPSeg...")
+                self.processor = CLIPSegProcessor.from_pretrained(
+                    MODEL_ID, cache_dir=HUGGINGFACE_HUB_CACHE, local_files_only=True,
+                    use_fast=False,
+                )
+                self.model = CLIPSegForImageSegmentation.from_pretrained(
+                    MODEL_ID, cache_dir=HUGGINGFACE_HUB_CACHE, local_files_only=True,
+                    use_safetensors=True,
+                ).to("cuda").eval()
+
+            alpha = rgba[..., 3:4].astype(np.float32) / 255
+            rgb = np.rint(rgba[..., :3] * alpha + 127 * (1 - alpha)).astype(np.uint8)
+            inputs = self.processor(
+                text=[CROWN_PROMPT], images=[Image.fromarray(rgb)], return_tensors="pt",
+            ).to("cuda")
+            if progress:
+                progress("CLIPSeg определяет крону...")
+            with torch.inference_mode():
+                logits = self.model(**inputs).logits.unsqueeze(1)
+                logits = F.interpolate(
+                    logits.float(), size=rgba.shape[:2], mode="bilinear", align_corners=False,
+                )
+                scores = logits.sigmoid()[0, 0].cpu().numpy().astype(np.float32)
+            if scores.shape != rgba.shape[:2]:
+                raise RuntimeError("CLIPSeg вернула карту неверного размера")
+            return scores
+        except torch.OutOfMemoryError as exc:
+            raise RuntimeError("Недостаточно VRAM для CLIPSeg. Закройте другие GPU-приложения.") from exc

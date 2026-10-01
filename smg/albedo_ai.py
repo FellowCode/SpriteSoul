@@ -105,7 +105,8 @@ def _sprite_labels(alpha: np.ndarray) -> tuple[np.ndarray, list[int]]:
 
 def generate_albedo(rgba: np.ndarray, progress=None, strength: float = 1.0,
                     illumination_sigma: float = 2.0, shadow_strength: float = 1.0,
-                    debug: bool = False, debug_dir: str | Path | None = None) -> np.ndarray:
+                    debug: bool = False, debug_dir: str | Path | None = None,
+                    session=None) -> np.ndarray:
     if rgba.ndim != 3 or rgba.shape[2] != 4 or rgba.dtype != np.uint8:
         raise ValueError("Albedo ожидает RGBA uint8")
     labels, regions = _sprite_labels(rgba[..., 3])
@@ -134,7 +135,10 @@ def generate_albedo(rgba: np.ndarray, progress=None, strength: float = 1.0,
                    "--output_dir", str(output_dir), "--model_dir", str(root / "weights/albedo"),
                    "--ddim", "100", "--batch_size", "1", "--splits_vertical", "1",
                    "--splits_horizontal", "1"]
-        _run_intrinsic(command, root)
+        if session is None:
+            _run_intrinsic(command, root)
+        else:
+            session.run(command[6:], progress)
         for index, region in enumerate(regions):
             path = output_dir / f"sprite_{index:04d}.png"
             if not path.is_file():

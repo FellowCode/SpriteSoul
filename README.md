@@ -30,6 +30,8 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\sprite-soul.exe setup --help
 .\.venv\Scripts\sprite-soul.exe generate sprite.png
 .\.venv\Scripts\sprite-soul.exe generate sprite.png --maps all
+.\.venv\Scripts\sprite-soul.exe generate tree.png well.png --maps all -o exported
+.\.venv\Scripts\sprite-soul.exe generate .\sprites\ --maps all -o exported
 .\.venv\Scripts\sprite-soul.exe generate sprite.png --maps normal
 .\.venv\Scripts\sprite-soul.exe generate sprite.png --maps roughness
 .\.venv\Scripts\sprite-soul.exe generate sprite.png --maps ao --ao-radius 32
@@ -39,6 +41,8 @@ py -3.11 -m venv .venv
 ```
 
 Можно также вызвать `python -m smg`. Режим `--progress json` выдаёт события JSON Lines в stdout, которые другая программа может читать во время установки и генерации. Подробные параметры, формат событий и пакетная обработка описаны в [руководстве CLI](docs/CLI.md).
+
+Для нескольких спрайтов CLI обрабатывает весь пакет по моделям: сначала Depth и AO, затем поиск кроны CLIPSeg, Normal, Albedo и Roughness. Каждая модель загружается один раз на свой проход и выгружается перед следующим; отдельные процессы Albedo и Roughness также используются повторно внутри прохода. Можно передать список файлов, каталог или шаблон в кавычках (`".\sprites\*.png"`). Каталог читается без вложенных папок. Промежуточные данные хранятся во временном каталоге и удаляются после завершения или Ctrl+C.
 
 Подать спрайт, сгенерировать все карты и сразу экспортировать PNG без сохранения проекта можно одной командой:
 

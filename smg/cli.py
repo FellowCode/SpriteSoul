@@ -1,6 +1,7 @@
 """Headless command-line entry point for Sprite Soul."""
 
 import argparse
+import glob
 import json
 import sys
 from pathlib import Path
@@ -64,8 +65,8 @@ def _add_progress_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_generate_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("input", nargs="+", type=Path, metavar="PNG|SSOUL",
-                        help="исходные PNG или сохранённые проекты .ssoul")
+    parser.add_argument("input", nargs="+", type=Path, metavar="PNG|SSOUL|DIR",
+                        help="исходные PNG, проекты .ssoul, каталоги или шаблоны (*.png); пакет обрабатывается по моделям")
     parser.add_argument("-o", "--output", default=Path("generated"), type=Path, metavar="DIR",
                         help="каталог для экспортируемых карт (по умолчанию: ./generated)")
     parser.add_argument("--maps", choices=("both", "depth", "normal", "albedo", "ao", "roughness", "all"), default="both",
@@ -124,6 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
                 "  sprite-soul setup --models all\n"
                 "  sprite-soul generate sprite.png --maps all -o exported --no-save-project\n"
                 "  sprite-soul generate sprite.png --progress json\n\n"
+                "  sprite-soul generate sprites/ --maps all -o exported\n\n"
                 "Подробности: sprite-soul generate --help; sprite-soul setup --help."),
     )
     parser.add_argument("--version", action="version", version="sprite-soul 0.1.0")
@@ -167,6 +169,58 @@ def _setup_command(args: argparse.Namespace, reporter: Reporter) -> int:
     return 0
 
 
+def _read_input(path: Path, args: argparse.Namespace):
+    from smg.export import load_project
+    from smg.pipeline import open_depth_png, open_png
+
+    if path.is_dir():
+        raise ValueError(f"В каталоге нет PNG или .ssoul: {path}")
+    if not path.exists() and glob.has_magic(str(path)):
+        raise ValueError(f"Нет файлов по шаблону: {path}")
+    if path.suffix.lower() not in (".png", ".ssoul"):
+        raise ValueError("Ожидается PNG или .ssoul")
+    if path.suffix.lower() == ".ssoul":
+        source_path, base_depth, _, _, foliage_mask = load_project(path, with_foliage_mask=True)
+    else:
+        source_path, base_depth, foliage_mask = path, None, None
+    rgba = open_png(source_path)
+    if args.depth_map:
+        depth_path = (args.depth_map / f"{source_path.stem}_depth.png"
+                      if args.depth_map.is_dir() else args.depth_map)
+        base_depth = open_depth_png(depth_path, rgba.shape[:2])
+    return source_path, rgba, base_depth, foliage_mask
+
+
+def _target_paths(source_path: Path, args: argparse.Namespace, reserved: set[Path]) -> list[Path]:
+    kinds = {"both": ("depth", "normal"), "all": ("depth", "normal", "albedo", "ao", "roughness")}
+    paths = [args.output / f"{source_path.stem}_{kind}.png"
+             for kind in kinds.get(args.maps, (args.maps,))]
+    if args.save_project:
+        paths.append(args.output / f"{source_path.stem}.ssoul")
+    for target in paths:
+        if target.resolve() in reserved:
+            raise ValueError(f"Повторяющееся имя выходного файла: {target}")
+        if target.exists() and not args.overwrite:
+            raise FileExistsError(f"Файл уже существует: {target} (используйте --overwrite)")
+    reserved.update(target.resolve() for target in paths)
+    return paths
+
+
+def _expand_inputs(inputs: list[Path]) -> list[Path]:
+    expanded = []
+    for path in inputs:
+        if path.is_dir():
+            matches = sorted((item for item in path.iterdir()
+                              if item.is_file() and item.suffix.lower() in (".png", ".ssoul")),
+                             key=lambda item: item.name.lower())
+        elif not path.exists() and glob.has_magic(str(path)):
+            matches = [Path(item) for item in sorted(glob.glob(str(path)))]
+        else:
+            matches = [path]
+        expanded.extend(matches or [path])
+    return expanded
+
+
 def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
              reporter: Reporter) -> list[Path]:
     from smg.ao import ao_from_depth
@@ -174,26 +228,15 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
     from smg.albedo_ai import generate_albedo
     from smg.crown_normal import compose_crown_normals
     from smg.depth.processing import DepthSettings, process_depth
-    from smg.export import export_albedo, export_ao, export_depth, export_normal, export_roughness, load_project, save_project
+    from smg.export import export_albedo, export_ao, export_depth, export_normal, export_roughness, save_project
     from smg.roughness_ai import generate_roughness
     from smg.normal import ai_normal, orient_ai_vectors, postprocess_ai_vectors
     from smg.normal_ai import DSINENormalModel
-    from smg.pipeline import generate_depth, open_depth_png, open_png
+    from smg.pipeline import generate_depth
     from smg.segmentation import detect_tree_crown
     from smg.setup import prepare_environment
 
-    if path.suffix.lower() == ".ssoul":
-        source_path, base_depth, _, _, foliage_mask = load_project(path, with_foliage_mask=True)
-        rgba = open_png(source_path)
-    else:
-        source_path = path
-        rgba = open_png(path)
-        base_depth = None
-        foliage_mask = None
-    if args.depth_map:
-        depth_path = (args.depth_map / f"{source_path.stem}_depth.png"
-                      if args.depth_map.is_dir() else args.depth_map)
-        base_depth = open_depth_png(depth_path, rgba.shape[:2])
+    source_path, rgba, base_depth, foliage_mask = _read_input(path, args)
     output = args.output
     stem = source_path.stem
     wants_depth = args.maps in ("both", "depth", "all")
@@ -202,26 +245,7 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
     wants_ao = args.maps in ("ao", "all")
     wants_roughness = args.maps in ("roughness", "all")
     needs_depth = wants_depth or wants_ao or args.save_project
-    paths = []
-    if wants_depth:
-        paths.append(output / f"{stem}_depth.png")
-    if wants_normal:
-        paths.append(output / f"{stem}_normal.png")
-    if wants_albedo:
-        paths.append(output / f"{stem}_albedo.png")
-    if wants_ao:
-        paths.append(output / f"{stem}_ao.png")
-    if wants_roughness:
-        paths.append(output / f"{stem}_roughness.png")
-    if args.save_project:
-        paths.append(output / f"{stem}.ssoul")
-    for target in paths:
-        key = target.resolve()
-        if key in reserved:
-            raise ValueError(f"Повторяющееся имя выходного файла: {target}")
-        if target.exists() and not args.overwrite:
-            raise FileExistsError(f"Файл уже существует: {target} (используйте --overwrite)")
-    reserved.update(target.resolve() for target in paths)
+    paths = _target_paths(source_path, args, reserved)
 
     def progress(message: str) -> None:
         reporter.runtime("inference", message)
@@ -318,12 +342,17 @@ def main(argv: list[str] | None = None) -> int:
         return _setup_command(args, reporter)
     if args.depth_map and args.maps not in ("both", "depth", "ao", "all") and not args.save_project:
         parser.error("--depth-map применяется только при генерации Depth, AO или сохранении проекта")
+    args.input = _expand_inputs(args.input)
     if args.depth_map and len(args.input) > 1 and not args.depth_map.is_dir():
         parser.error("для нескольких входов --depth-map должен указывать каталог с <имя>_depth.png")
     if args.albedo_debug and args.maps not in ("albedo", "all"):
         parser.error("--albedo-debug применяется только при экспорте Albedo")
     if args.ao_radius < 1 or args.ao_radius > 128:
         parser.error("--ao-radius должен быть от 1 до 128")
+    if len(args.input) > 1:
+        from smg.batch import run_batch
+
+        return run_batch(args, reporter)
     failed = 0
     processed = 0
     reserved: set[Path] = set()
@@ -331,8 +360,6 @@ def main(argv: list[str] | None = None) -> int:
         for path in args.input:
             reporter.input = path
             try:
-                if path.suffix.lower() not in (".png", ".ssoul"):
-                    raise ValueError("Ожидается PNG или .ssoul")
                 written = _run_one(path, args, reserved, reporter)
                 for target in written:
                     reporter.result(target)

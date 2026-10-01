@@ -291,6 +291,12 @@ def test_cli_batch_and_existing_output(tmp_path, monkeypatch):
     monkeypatch.setattr(setup, "prepare_environment", lambda models, progress, events=None: prepared.append(tuple(models)))
 
     class FakeDepth:
+        def __init__(self, keep_loaded):
+            assert keep_loaded
+
+        def unload(self):
+            pass
+
         def generate(self, rgba, progress=None):
             return np.tile(np.arange(rgba.shape[1], dtype=np.float32),
                            (rgba.shape[0], 1))
@@ -302,7 +308,7 @@ def test_cli_batch_and_existing_output(tmp_path, monkeypatch):
     output = tmp_path / "out"
     command = [str(one), str(two), "-o", str(output), "--maps", "depth"]
     assert main(command) == 0
-    assert prepared == [("depth",), ("depth",)]
+    assert prepared == [("depth",)]
     assert (output / "one_depth.png").exists()
     assert (output / "two_depth.png").exists()
     assert not (output / "one_normal.png").exists()

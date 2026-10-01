@@ -12,9 +12,18 @@ MODEL_ID = "depth-anything/Depth-Anything-V2-Small-hf"
 
 
 class DepthModel:
-    def __init__(self) -> None:
+    def __init__(self, keep_loaded: bool = False) -> None:
         self.model = None
         self.processor = None
+        self.keep_loaded = keep_loaded
+
+    def unload(self) -> None:
+        import torch
+
+        self.model = None
+        self.processor = None
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def _load(self) -> None:
         if self.model is not None:
@@ -27,10 +36,10 @@ class DepthModel:
         self.processor = AutoImageProcessor.from_pretrained(
             MODEL_ID, use_fast=False, cache_dir=HUGGINGFACE_HUB_CACHE
         )
-        self.model = AutoModelForDepthEstimation.from_pretrained(
+        model = AutoModelForDepthEstimation.from_pretrained(
             MODEL_ID, cache_dir=HUGGINGFACE_HUB_CACHE
         )
-        self.model.to("cuda").eval()
+        self.model = model.to("cuda").eval()
 
     def _infer(self, rgba: np.ndarray) -> np.ndarray:
         import torch
@@ -70,10 +79,8 @@ class DepthModel:
                 except torch.cuda.OutOfMemoryError as exc:
                     raise RuntimeError("Недостаточно VRAM даже для тайлов 768 px. Закройте другие GPU-приложения.") from exc
         finally:
-            self.model = None
-            self.processor = None
-            gc.collect()
-            torch.cuda.empty_cache()
+            if not self.keep_loaded:
+                self.unload()
 
     def _tiled(self, rgba: np.ndarray, progress=None, size: int = 1024) -> np.ndarray:
         h, w = rgba.shape[:2]

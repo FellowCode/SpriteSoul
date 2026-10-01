@@ -5,9 +5,7 @@ from pathlib import Path
 import sys
 
 
-def run(root: Path, source: Path, output: Path) -> None:
-    import numpy as np
-    from PIL import Image
+def load_pipeline(root: Path):
     import torch
     from accelerate import init_empty_weights
     from diffusers import AutoencoderKL, DDIMScheduler
@@ -16,7 +14,6 @@ def run(root: Path, source: Path, output: Path) -> None:
     sys.path.insert(0, str(root))
     from src.models.supermat_unet_2d_condition import SuperMatUNet2DConditionModel
     from src.pipelines.pipeline_supermat_stable_diffusion import SuperMatStableDiffusionPipeline
-    from src.utils import load_rgba_image_as_rgb_tensor
 
     if not torch.cuda.is_available():
         raise RuntimeError("SuperMat требует доступную CUDA-видеокарту NVIDIA")
@@ -47,6 +44,16 @@ def run(root: Path, source: Path, output: Path) -> None:
     ).to("cuda")
     pipe.enable_vae_slicing()
     pipe.set_progress_bar_config(disable=True)
+    return pipe
+
+
+def infer(pipe, source: Path, output: Path) -> None:
+    import numpy as np
+    from PIL import Image
+    import torch
+    from src.utils import load_rgba_image_as_rgb_tensor
+
+    dtype = torch.float16
     image = load_rgba_image_as_rgb_tensor(source, 512, torch.device("cuda")).to(dtype)
     print("SuperMat: Roughness, 512×512, один проход…", flush=True)
     with torch.inference_mode():
@@ -63,5 +70,23 @@ def run(root: Path, source: Path, output: Path) -> None:
     print("SuperMat: Roughness готова", flush=True)
 
 
+def run(root: Path, source: Path, output: Path) -> None:
+    infer(load_pipeline(root), source, output)
+
+
 if __name__ == "__main__":
-    run(*(Path(value) for value in sys.argv[1:]))
+    if sys.argv[2:] == ["--serve"]:
+        from model_session import serve
+
+        root = Path(sys.argv[1])
+        pipeline = None
+
+        def request(arguments):
+            global pipeline
+            if pipeline is None:
+                pipeline = load_pipeline(root)
+            infer(pipeline, *(Path(value) for value in arguments))
+
+        serve(request)
+    else:
+        run(*(Path(value) for value in sys.argv[1:]))

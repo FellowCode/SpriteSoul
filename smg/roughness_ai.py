@@ -62,7 +62,7 @@ def model_available(root: Path = SUPERMAT_ROOT) -> bool:
 
 
 def generate_roughness(rgba: np.ndarray,
-                       progress: Callable[[str], None] | None = None) -> np.ndarray:
+                       progress: Callable[[str], None] | None = None, session=None) -> np.ndarray:
     """Return linear roughness [0, 1], at source size; export supplies source alpha."""
     rgba = np.asarray(rgba)
     if rgba.ndim != 3 or rgba.shape[2] != 4 or rgba.dtype != np.uint8:
@@ -83,31 +83,38 @@ def generate_roughness(rgba: np.ndarray,
         env["PYTHONIOENCODING"] = "utf-8"
         # Only the child loads diffusers and allocates SuperMat CUDA tensors.
         worker = Path(__file__).with_name("supermat_worker.py")
-        process = subprocess.Popen(
-            [str(runtime_python(SUPERMAT_ROOT)), str(worker), str(SUPERMAT_ROOT), str(source), str(output)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            encoding="utf-8", errors="replace", env=env,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
-        tail = []
-        try:
-            assert process.stdout is not None
-            for line in process.stdout:
-                line = line.strip()
-                if line:
-                    tail = (tail + [line])[-10:]
-                    report(line)
-            if process.wait() != 0:
-                raise RuntimeError("Ошибка SuperMat: " + " | ".join(tail))
-        finally:
-            if process.poll() is None:
-                process.terminate()
-                process.wait()
-            if process.stdout is not None:
-                process.stdout.close()
+        if session is not None:
+            session.run([str(source), str(output)], report)
+        else:
+            _run_worker(worker, source, output, env, report)
         if not output.is_file():
             raise RuntimeError("SuperMat не сохранила Roughness")
         roughness = np.load(output, allow_pickle=False)
     if roughness.shape != rgba.shape[:2] or not np.isfinite(roughness).all():
         raise ValueError("SuperMat вернула неверную карту Roughness")
     return np.clip(roughness, 0, 1).astype(np.float32)
+
+
+def _run_worker(worker, source, output, env, report):
+    process = subprocess.Popen(
+        [str(runtime_python(SUPERMAT_ROOT)), str(worker), str(SUPERMAT_ROOT), str(source), str(output)],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        encoding="utf-8", errors="replace", env=env,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+    )
+    tail = []
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            line = line.strip()
+            if line:
+                tail = (tail + [line])[-10:]
+                report(line)
+        if process.wait() != 0:
+            raise RuntimeError("Ошибка SuperMat: " + " | ".join(tail))
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait()
+        if process.stdout is not None:
+            process.stdout.close()

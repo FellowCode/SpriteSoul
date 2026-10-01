@@ -66,14 +66,34 @@ def load_model(config, ckpt, device, vram_O=False, verbose=True):
     return model
 
 
-def run(root: Path, arguments: list[str]) -> None:
+def cached_model_loader():
+    """Retain only the inference weights across sequential worker requests."""
+    model = None
+
+    def load_once(*args, **kwargs):
+        nonlocal model
+        if model is None:
+            model = load_model(*args, **kwargs)
+        return model
+
+    return load_once
+
+
+def run(root: Path, arguments: list[str], loader=load_model) -> None:
     sys.path.insert(0, str(root))
     from models import matfusion
 
-    matfusion.load_model_from_config = load_model
+    matfusion.load_model_from_config = loader
     sys.argv = [str(root / "inference.py"), *arguments]
     runpy.run_path(sys.argv[0], run_name="__main__")
 
 
 if __name__ == "__main__":
-    run(Path(sys.argv[1]), sys.argv[2:])
+    root = Path(sys.argv[1])
+    if sys.argv[2:] == ["--serve"]:
+        from model_session import serve
+
+        loader = cached_model_loader()
+        serve(lambda arguments: run(root, arguments, loader))
+    else:
+        run(root, sys.argv[2:])

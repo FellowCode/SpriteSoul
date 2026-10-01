@@ -44,11 +44,20 @@ def _source_root(progress=None) -> Path:
 
 
 class DSINENormalModel:
-    def __init__(self, fov: float = 60.0, max_side: int = 512):
+    def __init__(self, fov: float = 60.0, max_side: int = 512, keep_loaded: bool = False):
         if not 20 <= fov <= 120:
             raise ValueError("DSINE FOV должен быть от 20 до 120 градусов")
         self.fov = fov
         self.max_side = max_side
+        self.keep_loaded = keep_loaded
+        self.model = None
+
+    def unload(self) -> None:
+        import torch
+
+        self.model = None
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def _load(self):
         import geffnet
@@ -132,23 +141,22 @@ class DSINENormalModel:
             raise ValueError("DSINE ожидает RGBA uint8")
         if not torch.cuda.is_available():
             raise RuntimeError("Для DSINE нужна NVIDIA CUDA")
-        model = None
         try:
-            if progress:
-                progress("Загрузка DSINE...")
-            model = self._load()
+            if self.model is None:
+                if progress:
+                    progress("Загрузка DSINE...")
+                self.model = self._load()
             if progress:
                 progress("Генерация AI Normal...")
             try:
-                return self._infer(model, rgba, self.max_side)
+                return self._infer(self.model, rgba, self.max_side)
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
                 if progress:
                     progress("Недостаточно VRAM; повтор с меньшим разрешением...")
-                return self._infer(model, rgba, min(self.max_side, 384))
+                return self._infer(self.model, rgba, min(self.max_side, 384))
         except torch.cuda.OutOfMemoryError as exc:
             raise RuntimeError("Недостаточно VRAM для DSINE. Закройте другие GPU-приложения.") from exc
         finally:
-            del model
-            gc.collect()
-            torch.cuda.empty_cache()
+            if not self.keep_loaded:
+                self.unload()

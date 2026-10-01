@@ -46,6 +46,7 @@ def test_setup_prepares_clipseg_on_demand_and_uses_cuda(monkeypatch):
 
 
 def test_setup_installs_cuda_wheel_only_when_needed(monkeypatch):
+    monkeypatch.delitem(setup.sys.modules, "torch", raising=False)
     statuses = iter([{"error": "No module named torch"},
                      {"version": "2.6.0+cu126", "cuda": "12.6", "available": True}])
     monkeypatch.setattr(setup, "_torch_status", lambda: next(statuses))
@@ -108,6 +109,7 @@ def test_clipseg_availability_checks_every_required_file(monkeypatch):
 
 
 def test_cuda_installed_but_unavailable_reports_driver_issue(monkeypatch):
+    monkeypatch.delitem(setup.sys.modules, "torch", raising=False)
     monkeypatch.setattr(setup, "_torch_status", lambda: {"version": "2.6.0+cu126",
                                                        "cuda": "12.6", "available": False})
     monkeypatch.setattr(setup, "_cuda_index", lambda: "cu126")
