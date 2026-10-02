@@ -144,6 +144,17 @@ def test_batch_all_maps_reuses_models_in_order(tmp_path, batch_models, capsys, i
     results = [item for item in messages if item["event"] == "result"]
     assert len(results) == 12
     assert {item["input"] for item in results} == set(map(str, paths))
+    for kind in ("depth", "normal", "albedo", "ao", "roughness"):
+        counts = [item for item in messages if item.get("map") == kind]
+        assert [item["current"] for item in counts] == [0, 1, 2]
+        assert all(item["total"] == 2 and item["unit"] == "maps"
+                   and item["phase"] == "batch" for item in counts)
+        assert "input" not in counts[0]
+        assert [item["input"] for item in counts[1:]] == list(map(str, paths))
+    for index, item in enumerate(messages):
+        if item.get("map") and item["current"]:
+            assert messages[index - 1]["event"] == "result"
+            assert messages[index - 1]["path"].endswith(f"_{item['map']}.png")
     assert messages[-1] == {"schema_version": 1, "event": "complete", "status": "success",
                             "processed": 2, "failed": 0}
 
@@ -172,6 +183,44 @@ def test_batch_failure_skips_later_stages_for_one_sprite(tmp_path, batch_models,
     error, = [item for item in messages if item["event"] == "error"]
     assert error["input"] == str(paths[0]) and error["message"] == "broken sprite"
     assert messages[-1]["processed"] == messages[-1]["failed"] == 1
+    for kind in ("depth", "ao", "normal", "albedo", "roughness"):
+        counts = [item for item in messages if item.get("map") == kind]
+        expected = [0, 1, 2] if kind in ("depth", "ao") else [0, 1]
+        assert [item["current"] for item in counts] == expected
+        assert all(item["total"] == 2 for item in counts)
+
+
+@pytest.mark.parametrize("mode", ["text", "none"])
+def test_batch_map_counts_text_and_quiet(tmp_path, batch_models, capsys, mode):
+    paths = sources(tmp_path)
+    assert main([*map(str, paths), "--maps", "depth", "--progress", mode,
+                 "-o", str(tmp_path / "out")]) == 0
+    captured = capsys.readouterr()
+    assert len(captured.out.splitlines()) == 2
+    if mode == "none":
+        assert captured.err == ""
+    else:
+        for current in (0, 1, 2):
+            assert f"Depth: сгенерировано {current} из 2 карт" in captured.err
+
+
+def test_batch_failed_export_does_not_increment_map_count(tmp_path, batch_models, monkeypatch, capsys):
+    from smg import export
+
+    paths = sources(tmp_path)
+    original = export.export_ao
+
+    def fail_first(source, *args):
+        if source == paths[0]:
+            raise RuntimeError("AO export failed")
+        return original(source, *args)
+
+    monkeypatch.setattr(export, "export_ao", fail_first)
+    assert main([*map(str, paths), "--maps", "all", "--progress", "json",
+                 "-o", str(tmp_path / "out")]) == 1
+    messages = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [item["current"] for item in messages if item.get("map") == "depth"] == [0, 1, 2]
+    assert [item["current"] for item in messages if item.get("map") == "ao"] == [0, 1]
 
 
 def test_batch_interrupt_unloads_active_model(tmp_path, batch_models, monkeypatch, capsys):

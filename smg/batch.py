@@ -40,6 +40,18 @@ def run_batch(args, reporter) -> int:
     jobs = []
     failed = processed = 0
     reserved = set()
+    generated = dict.fromkeys(selected, 0)
+    total = len(args.input)
+
+    def map_progress(kind):
+        current = generated[kind]
+        label = {"depth": "Depth", "normal": "Normal", "albedo": "Albedo",
+                 "ao": "AO", "roughness": "Roughness"}[kind]
+        message = f"{label}: сгенерировано {current} из {total} карт"
+        reporter.text(message)
+        reporter.emit({"event": "progress", "phase": "batch", "status": "update",
+                       "message": message, "map": kind, "current": current,
+                       "total": total, "unit": "maps"})
 
     def progress(message):
         reporter.runtime("inference", message)
@@ -93,6 +105,8 @@ def run_batch(args, reporter) -> int:
         else:
             target = exporter(job.source, values, alpha, args.output)
         reporter.result(target)
+        generated[kind] += 1
+        map_progress(kind)
 
     def depth_pass(job, state, model):
         rgba = state["rgba"]
@@ -165,6 +179,9 @@ def run_batch(args, reporter) -> int:
         processed += 1
 
     try:
+        reporter.input = None
+        for kind in selected:
+            map_progress(kind)
         with tempfile.TemporaryDirectory(prefix="sprite-soul-batch-") as temporary:
             for index, path in enumerate(args.input):
                 reporter.input = path
