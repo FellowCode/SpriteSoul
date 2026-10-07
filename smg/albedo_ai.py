@@ -12,7 +12,7 @@ import numpy as np
 from PIL import Image
 
 from smg.albedo import prepare_intrinsic_input, reconstruct_albedo
-from smg.model_paths import INTRINSIC_ROOT
+from smg.model_paths import INTRINSIC_ROOT, intrinsic_python
 
 
 DEFAULT_INTRINSIC_ROOT = INTRINSIC_ROOT
@@ -76,7 +76,7 @@ def _enable_low_vram(root: Path) -> None:
 def _experiment() -> tuple[Path, Path]:
     configured = os.environ.get("SPRITE_SOUL_INTRINSIC_ROOT")
     root = Path(configured).expanduser() if configured else DEFAULT_INTRINSIC_ROOT
-    python = root / ".venv-intrinsic" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    python = intrinsic_python(root)
     if not (root / "inference.py").is_file() or not (root / "weights/albedo/checkpoints/last.ckpt").is_file() or not python.is_file():
         raise RuntimeError(
             f"Не найдена установка IntrinsicAnything: {root}. "

@@ -1,5 +1,7 @@
 # Проверка IntrinsicAnything для albedo спрайтов
 
+При установке в глубоко вложенный каталог Windows окружение Python автоматически создаётся в `%LOCALAPPDATA%/ss-venvs/<идентификатор>`, чтобы длинные имена заголовков PyTorch не превышали лимит пути. Исходники и веса остаются в `models/IntrinsicAnything`. Для короткого пути и других ОС используется `.venv-intrinsic` в каталоге модели. После ошибки длинного пути повторите `python -m smg setup --models albedo`: установщик и запуск модели выбирают одинаковое расположение окружения.
+
 Проверка выполнена 27 сентября 2026 года на двух изображениях из `example_sprites/`. Исходный код модели: [zju3dv/IntrinsicAnything](https://github.com/zju3dv/IntrinsicAnything), checkpoint albedo: [LittleFrog/IntrinsicAnything](https://huggingface.co/LittleFrog/IntrinsicAnything). Результаты эксперимента перенесены в локальную папку `generated/albedo_intrinsicanything/`, которую Git игнорирует; в репозитории хранятся только исходные тестовые спрайты.
 
 ## Среда и входные данные

@@ -15,7 +15,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from smg.depth.inference import MODEL_ID
-from smg.model_paths import HUGGINGFACE_HUB_CACHE, INTRINSIC_ROOT, MODELS_ROOT
+from smg.model_paths import HUGGINGFACE_HUB_CACHE, INTRINSIC_ROOT, MODELS_ROOT, intrinsic_environment, intrinsic_python
 from smg.normal_ai import CHECKPOINT_REPO, DSINE_SOURCE_ROOT, _source_root
 from smg.segmentation import MODEL_FILES as CLIPSEG_FILES, MODEL_ID as CLIPSEG_MODEL_ID
 
@@ -65,9 +65,7 @@ def model_available(model: str) -> bool:
             and _cached_model_file(CHECKPOINT_REPO, "dsine.pt")
         )
     if model == "albedo":
-        python = INTRINSIC_ROOT / ".venv-intrinsic" / (
-            "Scripts/python.exe" if sys.platform == "win32" else "bin/python"
-        )
+        python = intrinsic_python(INTRINSIC_ROOT)
         return (
             (INTRINSIC_ROOT / "inference.py").is_file()
             and python.is_file()
@@ -271,9 +269,7 @@ def _download_intrinsic_source(progress: Progress, events: Events | None) -> Non
 
 
 def _prepare_intrinsic_runtime(progress: Progress, events: Events | None) -> Path:
-    python = INTRINSIC_ROOT / ".venv-intrinsic" / (
-        "Scripts/python.exe" if sys.platform == "win32" else "bin/python"
-    )
+    python = intrinsic_python(INTRINSIC_ROOT)
     if python.is_file():
         check = subprocess.run(
             [str(python), "-c", (
@@ -285,11 +281,11 @@ def _prepare_intrinsic_runtime(progress: Progress, events: Events | None) -> Pat
         )
         if check.returncode == 0:
             return python
-    message = "IntrinsicAnything: создание отдельного Python-окружения"
+    message = f"IntrinsicAnything: создание отдельного Python-окружения: {intrinsic_environment(INTRINSIC_ROOT)}"
     progress(message)
     _emit(events, "pip_install", "start", message, component="intrinsic-runtime")
     result = subprocess.run(
-        [sys.executable, "-m", "venv", str(INTRINSIC_ROOT / ".venv-intrinsic")],
+        [sys.executable, "-m", "venv", str(intrinsic_environment(INTRINSIC_ROOT))],
         capture_output=True, text=True, check=False,
         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
     )
