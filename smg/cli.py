@@ -73,6 +73,10 @@ def _add_generate_args(parser: argparse.ArgumentParser) -> None:
                         help="какие карты записать (по умолчанию: Depth и Normal; all — все пять)")
     parser.add_argument("--depth-map", type=Path, metavar="PNG|DIR",
                         help="готовая Depth: PNG для одного входа или каталог с <имя>_depth.png для пакета")
+    parser.add_argument("--normal-map", type=Path, metavar="PNG|DIR",
+                        help="готовая Normal для AO/Normal: PNG или каталог с <имя>_normal.png; ориентация --convention")
+    parser.add_argument("--ao-depth-only", action="store_true",
+                        help="рассчитать AO только из Depth, без генерации DSINE Normal")
     parser.add_argument("--normal-source", choices=("ai",), default="ai",
                         help="источник нормалей: только AI/DSINE")
     parser.add_argument("--convention", choices=("opengl", "directx"), default="opengl",
@@ -128,7 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
                 "  sprite-soul generate sprites/ --maps all -o exported\n\n"
                 "Подробности: sprite-soul generate --help; sprite-soul setup --help."),
     )
-    parser.add_argument("--version", action="version", version="sprite-soul 0.1.0")
+    parser.add_argument("--version", action="version", version="sprite-soul 0.1.2")
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")
     generate = commands.add_parser(
         "generate", help="создать карты из PNG или проекта .ssoul",
@@ -206,6 +210,20 @@ def _target_paths(source_path: Path, args: argparse.Namespace, reserved: set[Pat
     return paths
 
 
+def _read_normal_input(source_path: Path, rgba, args: argparse.Namespace):
+    from smg.normal import decode_normals
+    from smg.pipeline import open_png
+
+    if args.normal_map is None:
+        return None
+    path = (args.normal_map / f"{source_path.stem}_normal.png"
+            if args.normal_map.is_dir() else args.normal_map)
+    pixels = open_png(path)
+    if pixels.shape[:2] != rgba.shape[:2]:
+        raise ValueError(f"Normal {pixels.shape[1]}x{pixels.shape[0]} не совпадает с размером спрайта")
+    return decode_normals(pixels, "OpenGL" if args.convention == "opengl" else "DirectX")
+
+
 def _expand_inputs(inputs: list[Path]) -> list[Path]:
     expanded = []
     for path in inputs:
@@ -245,6 +263,8 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
     wants_ao = args.maps in ("ao", "all")
     wants_roughness = args.maps in ("roughness", "all")
     needs_depth = wants_depth or wants_ao or args.save_project
+    needs_normal = wants_normal or (wants_ao and not args.ao_depth_only)
+    vectors = _read_normal_input(source_path, rgba, args)
     paths = _target_paths(source_path, args, reserved)
 
     def progress(message: str) -> None:
@@ -253,7 +273,7 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
     models = []
     if needs_depth and base_depth is None:
         models.append("depth")
-    if wants_normal:
+    if needs_normal and vectors is None:
         models.append("ai")
         if args.crown_mode == "auto" and foliage_mask is None:
             models.append("clipseg")
@@ -274,13 +294,12 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
         ))
 
     normal = None
-    if wants_normal:
+    if needs_normal and vectors is None:
         if args.crown_mode == "auto" and foliage_mask is None:
             if args.crown_threshold == 0.5:
                 foliage_mask = detect_tree_crown(rgba, progress)
             else:
                 foliage_mask = detect_tree_crown(rgba, progress, threshold=args.crown_threshold)
-        convention = "OpenGL" if args.convention == "opengl" else "DirectX"
         progress("Генерация AI Normal...")
         vectors = DSINENormalModel(args.dsine_fov).generate(rgba, progress)
         if vectors.shape != (*rgba.shape[:2], 3):
@@ -291,13 +310,15 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
         )
         if args.crown_mode == "auto" and foliage_mask is not None:
             vectors = compose_crown_normals(vectors, foliage_mask, rgba[..., 3])
-        normal = ai_normal(vectors, rgba[..., 3], convention)
+    if wants_normal:
+        normal = ai_normal(vectors, rgba[..., 3], "OpenGL" if args.convention == "opengl" else "DirectX")
 
     if wants_depth:
         export_depth(source_path, depth, rgba[..., 3], output)
     if wants_ao:
-        progress("Расчёт AO из Depth...")
-        ao = ao_from_depth(depth, rgba[..., 3], args.ao_radius, args.ao_strength)
+        progress("Расчёт AO из Depth и Normal..." if vectors is not None else "Расчёт AO из Depth...")
+        ao = ao_from_depth(depth, rgba[..., 3], args.ao_radius, args.ao_strength,
+                           normals=None if args.ao_depth_only else vectors)
         export_ao(source_path, ao, rgba[..., 3], output)
     if wants_normal:
         export_normal(source_path, normal, output)
@@ -343,6 +364,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.depth_map and args.maps not in ("both", "depth", "ao", "all") and not args.save_project:
         parser.error("--depth-map применяется только при генерации Depth, AO или сохранении проекта")
     args.input = _expand_inputs(args.input)
+    if args.normal_map and args.maps not in ("both", "normal", "ao", "all"):
+        parser.error("--normal-map применяется только при генерации Normal или AO")
+    if args.normal_map and len(args.input) > 1 and not args.normal_map.is_dir():
+        parser.error("для нескольких входов --normal-map должен указывать каталог с <имя>_normal.png")
+    if args.ao_depth_only and (args.maps not in ("ao", "all") or args.normal_map):
+        parser.error("--ao-depth-only применяется к AO и несовместим с --normal-map")
     if args.depth_map and len(args.input) > 1 and not args.depth_map.is_dir():
         parser.error("для нескольких входов --depth-map должен указывать каталог с <имя>_depth.png")
     if args.albedo_debug and args.maps not in ("albedo", "all"):

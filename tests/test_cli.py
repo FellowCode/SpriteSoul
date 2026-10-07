@@ -84,7 +84,7 @@ def test_cli_ao_from_existing_depth_map_skips_model(tmp_path, monkeypatch):
 
     output = tmp_path / "out"
     assert main([str(source), "-o", str(output), "--maps", "ao",
-                 "--depth-map", str(depth_map)]) == 0
+                 "--depth-map", str(depth_map), "--ao-depth-only"]) == 0
     ao = open_png(output / "sprite_ao.png")
     assert ao.shape == rgba.shape
     assert np.array_equal(ao[..., 3], rgba[..., 3])
@@ -115,11 +115,65 @@ def test_cli_batch_ao_uses_matching_depth_maps(tmp_path, monkeypatch):
 
     output = tmp_path / "out"
     assert main([*(str(source) for source in sources), "-o", str(output),
-                 "--maps", "ao", "--depth-map", str(depth_dir)]) == 0
+                 "--maps", "ao", "--depth-map", str(depth_dir), "--ao-depth-only"]) == 0
     for name, shape in (("one", (8, 11)), ("two", (9, 12))):
         ao = open_png(output / f"{name}_ao.png")
         assert ao.shape[:2] == shape
         assert ao[3, 5, 0] < ao[2, 3, 0]
+
+
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("convention", ["opengl", "directx"])
+def test_cli_ao_uses_imported_depth_and_normals_without_models(tmp_path, monkeypatch, batch, convention):
+    from smg import setup
+    from smg.ao import ao_from_depth
+    from smg.normal import ai_normal, decode_normals, normalize_vectors
+
+    monkeypatch.setattr(setup, "prepare_environment", lambda *a, **kw:
+                        (_ for _ in ()).throw(AssertionError("Imported maps must not load models")))
+    directory = tmp_path / "maps"
+    directory.mkdir()
+    inputs = []
+    expected = {}
+    for name in (["one", "two"] if batch else ["one"]):
+        rgba = np.full((33, 33, 4), (120, 100, 80, 255), np.uint8)
+        rgba[0, :, 3] = 0
+        rgba[1, :, 3] = 128
+        source = tmp_path / f"{name}.png"
+        Image.fromarray(rgba).save(source)
+        inputs.append(source)
+        y, x = np.mgrid[:33, :33].astype(np.float32) - 16
+        relief = -3 * np.exp(-(x*x + y*y) / 18)
+        gy, gx = np.gradient(relief)
+        vectors = normalize_vectors(np.dstack((-gx, gy, np.ones_like(gx))))
+        normal = ai_normal(vectors, rgba[..., 3], "OpenGL" if convention == "opengl" else "DirectX")
+        Image.fromarray(normal).save(directory / f"{name}_normal.png")
+        assert cv2.imwrite(str(directory / f"{name}_depth.png"), np.full((33, 33), 128, np.uint8))
+        decoded = decode_normals(normal, "OpenGL" if convention == "opengl" else "DirectX")
+        expected[name] = np.rint(ao_from_depth(np.full((33, 33), 128/255, np.float32),
+                                             rgba[..., 3], normals=decoded) * 255).astype(np.uint8)
+    output = tmp_path / "out"
+    assert main([*map(str, inputs), "--maps", "ao", "--depth-map", str(directory),
+                 "--normal-map", str(directory), "--convention", convention, "-o", str(output)]) == 0
+    assert len(list(output.iterdir())) == len(inputs)
+    for source in inputs:
+        ao = open_png(output / f"{source.stem}_ao.png")
+        assert np.array_equal(ao[..., 3], open_png(source)[..., 3])
+        assert np.array_equal(ao[..., 0], expected[source.stem])
+        assert ao[16, 16, 0] < 250
+
+
+def test_cli_rejects_wrong_normal_size_before_loading_models(tmp_path, monkeypatch, capsys):
+    from smg import setup
+
+    monkeypatch.setattr(setup, "prepare_environment", lambda *a, **kw:
+                        (_ for _ in ()).throw(AssertionError("Invalid map reached model setup")))
+    source = tmp_path / "sprite.png"
+    _source(source)
+    normal = tmp_path / "normal.png"
+    Image.fromarray(np.full((4, 5, 4), 255, np.uint8)).save(normal)
+    assert main([str(source), "--maps", "ao", "--normal-map", str(normal)]) == 1
+    assert "Normal 5x4" in capsys.readouterr().err
 
 
 def test_cli_project_depth_can_be_overridden_by_png(tmp_path, monkeypatch):
@@ -178,7 +232,7 @@ def test_cli_rejects_irrelevant_or_unmatched_depth_map(tmp_path):
     ("depth", ("depth",), {"depth"}),
     ("normal", ("ai", "clipseg"), {"normal"}),
     ("albedo", ("albedo",), {"albedo"}),
-    ("ao", ("depth",), {"ao"}),
+    ("ao", ("depth", "ai", "clipseg"), {"ao"}),
     ("roughness", ("roughness",), {"roughness"}),
     ("all", ("depth", "ai", "clipseg", "albedo", "roughness"),
      {"depth", "normal", "albedo", "ao", "roughness"}),

@@ -185,7 +185,7 @@ def test_batch_failure_skips_later_stages_for_one_sprite(tmp_path, batch_models,
     assert messages[-1]["processed"] == messages[-1]["failed"] == 1
     for kind in ("depth", "ao", "normal", "albedo", "roughness"):
         counts = [item for item in messages if item.get("map") == kind]
-        expected = [0, 1, 2] if kind in ("depth", "ao") else [0, 1]
+        expected = [0, 1, 2] if kind == "depth" else [0, 1]
         assert [item["current"] for item in counts] == expected
         assert all(item["total"] == 2 for item in counts)
 

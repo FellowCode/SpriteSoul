@@ -6,7 +6,7 @@ import tempfile
 
 import numpy as np
 
-from smg.cli import _read_input, _target_paths
+from smg.cli import _read_input, _read_normal_input, _target_paths
 
 
 @dataclass
@@ -16,6 +16,7 @@ class Job:
     cache: Path
     needs_depth_model: bool
     needs_crown: bool
+    needs_normal_model: bool
     failed: bool = False
 
 
@@ -36,6 +37,7 @@ def run_batch(args, reporter) -> int:
     kinds = {"both": ("depth", "normal"), "all": ("depth", "normal", "albedo", "ao", "roughness")}
     selected = kinds.get(args.maps, (args.maps,))
     needs_depth = "depth" in selected or "ao" in selected or args.save_project
+    needs_normal = "normal" in selected or ("ao" in selected and not args.ao_depth_only)
     convention = "OpenGL" if args.convention == "opengl" else "DirectX"
     jobs = []
     failed = processed = 0
@@ -119,10 +121,7 @@ def run_batch(args, reporter) -> int:
         ))
         if "depth" in selected:
             write(job, "depth", depth, rgba[..., 3])
-        if "ao" in selected:
-            progress("Расчёт AO из Depth...")
-            write(job, "ao", ao_from_depth(depth, rgba[..., 3], args.ao_radius, args.ao_strength), rgba[..., 3])
-        if args.save_project:
+        if args.save_project or "ao" in selected:
             state["depth"] = depth
         else:
             state.pop("depth", None)
@@ -137,14 +136,29 @@ def run_batch(args, reporter) -> int:
 
     def normal_pass(job, state, model):
         rgba = state["rgba"]
-        vectors = model.generate(rgba, progress)
-        if vectors.shape != (*rgba.shape[:2], 3):
-            raise ValueError("DSINE вернула неверный размер Normal")
-        vectors = orient_ai_vectors(vectors, args.invert_ai_x, args.invert_ai_y)
-        vectors = postprocess_ai_vectors(vectors, rgba, args.ai_smoothing, args.ai_details)
-        if args.crown_mode == "auto" and "foliage" in state:
-            vectors = compose_crown_normals(vectors, state["foliage"], rgba[..., 3])
-        write(job, "normal", ai_normal(vectors, rgba[..., 3], convention))
+        vectors = state.get("normal_vectors")
+        if vectors is None:
+            vectors = model.generate(rgba, progress)
+            if vectors.shape != (*rgba.shape[:2], 3):
+                raise ValueError("DSINE вернула неверный размер Normal")
+            vectors = orient_ai_vectors(vectors, args.invert_ai_x, args.invert_ai_y)
+            vectors = postprocess_ai_vectors(vectors, rgba, args.ai_smoothing, args.ai_details)
+            if args.crown_mode == "auto" and "foliage" in state:
+                vectors = compose_crown_normals(vectors, state["foliage"], rgba[..., 3])
+        if "normal" in selected:
+            write(job, "normal", ai_normal(vectors, rgba[..., 3], convention))
+        if "ao" in selected:
+            state["normal_vectors"] = vectors
+
+    def ao_pass(job, state, _resource):
+        alpha = state["rgba"][..., 3]
+        vectors = None if args.ao_depth_only else state.get("normal_vectors")
+        progress("Расчёт AO из Depth и Normal..." if vectors is not None else "Расчёт AO из Depth...")
+        write(job, "ao", ao_from_depth(state["depth"], alpha, args.ao_radius, args.ao_strength,
+                                       normals=vectors), alpha)
+        state.pop("normal_vectors", None)
+        if not args.save_project:
+            state.pop("depth", None)
 
     def albedo_session():
         root, python = albedo_ai._experiment()
@@ -187,6 +201,7 @@ def run_batch(args, reporter) -> int:
                 reporter.input = path
                 try:
                     source, rgba, depth, foliage = _read_input(path, args)
+                    vectors = _read_normal_input(source, rgba, args)
                     _target_paths(source, args, reserved)
                     cache = Path(temporary) / f"{index}.npz"
                     state = {"rgba": rgba}
@@ -194,18 +209,21 @@ def run_batch(args, reporter) -> int:
                         state["depth"] = depth
                     if foliage is not None:
                         state["foliage"] = foliage
+                    if vectors is not None:
+                        state["normal_vectors"] = vectors
                     np.savez(cache, **state)
                     jobs.append(Job(path, source, cache, needs_depth and depth is None,
-                                    "normal" in selected and args.crown_mode == "auto" and foliage is None))
+                                    needs_normal and vectors is None and args.crown_mode == "auto" and foliage is None,
+                                    needs_normal and vectors is None))
                 except Exception as exc:
                     reporter.error(str(exc))
                     failed += 1
             # Do not retain the last preflight image in RAM throughout the batch.
-            source = rgba = depth = foliage = state = None
+            source = rgba = depth = foliage = vectors = state = None
             models = []
             if any(job.needs_depth_model for job in jobs):
                 models.append("depth")
-            if jobs and "normal" in selected:
+            if any(job.needs_normal_model for job in jobs):
                 models.append("ai")
                 if any(job.needs_crown for job in jobs):
                     models.append("clipseg")
@@ -218,12 +236,16 @@ def run_batch(args, reporter) -> int:
                     for job in jobs:
                         fail(job, exc)
             if needs_depth:
-                stage("Depth / AO", depth_pass,
+                stage("Depth", depth_pass,
                       (lambda: DepthModel(keep_loaded=True)) if "depth" in models else None,
-                      persist=args.save_project)
+                      persist=args.save_project or "ao" in selected)
             stage("CLIPSeg", crown_pass, CrownModel, lambda job: job.needs_crown, persist=True)
-            if "normal" in selected:
-                stage("Normal", normal_pass, lambda: DSINENormalModel(args.dsine_fov, keep_loaded=True))
+            if needs_normal:
+                stage("Normal", normal_pass,
+                      (lambda: DSINENormalModel(args.dsine_fov, keep_loaded=True)) if "ai" in models else None,
+                      persist="ao" in selected)
+            if "ao" in selected:
+                stage("AO", ao_pass, persist=True)
             if "albedo" in selected:
                 stage("Albedo", albedo_pass, albedo_session)
             if "roughness" in selected:

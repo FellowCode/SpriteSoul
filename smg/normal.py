@@ -52,6 +52,18 @@ def ai_normal(vectors: np.ndarray, alpha: np.ndarray, convention: str = "OpenGL"
     return encode_normals(mapped, alpha)
 
 
+def decode_normals(pixels: np.ndarray, convention: str = "OpenGL") -> np.ndarray:
+    """Decode an RGB/RGBA uint8 normal map into canonical OpenGL vectors."""
+    if pixels.ndim != 3 or pixels.shape[-1] not in (3, 4) or pixels.dtype != np.uint8:
+        raise ValueError("Normal map must be RGB/RGBA uint8")
+    if convention not in ("OpenGL", "DirectX"):
+        raise ValueError("Unknown normal convention")
+    vectors = pixels[..., :3].astype(np.float32) / 255 * 2 - 1
+    if convention == "DirectX":
+        vectors[..., 1] *= -1
+    return normalize_vectors(vectors)
+
+
 def smooth_ai_vectors(vectors: np.ndarray, alpha: np.ndarray, sigma: float = 1.5) -> np.ndarray:
     """Smooth AI normals without bleeding transparent background into silhouettes."""
     values = normalize_vectors(vectors)

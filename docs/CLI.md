@@ -1,6 +1,6 @@
 # Sprite Soul CLI
 
-`--maps all` создаёт Depth, Normal, Albedo, AO и Roughness за один запуск. `--maps depth|normal|albedo|ao|roughness` создаёт одну выбранную карту; `both` оставлен для Depth и Normal и используется по умолчанию. AO рассчитывается из Depth. Если Depth уже готова, передайте `--depth-map карта.png`, каталог карт для пакета или откройте `.ssoul`: нейромодель глубины повторно не запускается. Roughness создаётся SuperMat независимо от остальных карт.
+`--maps all` создаёт Depth, Normal, Albedo, AO и Roughness за один запуск. `--maps depth|normal|albedo|ao|roughness` создаёт одну выбранную карту; `both` оставлен для Depth и Normal и используется по умолчанию. AO рассчитывается из Depth и Normal; недостающие карты генерируются Depth Anything V2 и DSINE. Готовую Depth передайте через `--depth-map` или откройте `.ssoul`; готовую Normal — через `--normal-map`. При наличии обеих карт AI-модели не запускаются. `--maps ao` экспортирует только AO, вспомогательные карты не записываются. `--ao-depth-only` использует только Depth. Roughness создаётся SuperMat независимо от остальных карт.
 
 CLI генерирует карты из PNG без запуска графического интерфейса. После установки из корня проекта:
 
@@ -71,6 +71,12 @@ py -3.11 -m venv .venv
 
 # Только AO; можно добавить --depth-map для пропуска Depth AI
 .\.venv\Scripts\sprite-soul.exe generate .\assets\tree.png --maps ao --ao-radius 32 --ao-strength 1.5
+
+# AO из двух готовых карт, без запуска моделей
+.\.venv\Scripts\sprite-soul.exe generate .\assets\tree.png --maps ao --depth-map .\maps\tree_depth.png --normal-map .\maps\tree_normal.png
+
+# AO только из Depth, без DSINE
+.\.venv\Scripts\sprite-soul.exe generate .\assets\tree.png --maps ao --depth-map .\maps\tree_depth.png --ao-depth-only
 
 # Только Albedo с настройками коррекции
 .\.venv\Scripts\sprite-soul.exe generate .\assets\tree.png --maps albedo --albedo-strength 1.2 --albedo-smooth 2 --albedo-shadows 0.8
@@ -151,7 +157,7 @@ sprite-soul generate .\sprites\ --maps all -o exported
 sprite-soul generate ".\sprites\*.png" --maps both -o exported
 ```
 
-Для нескольких входов генерация выполняется проходами по всему пакету: Depth (сразу с экспортом Depth и расчётом AO), CLIPSeg для спрайтов без сохранённой маски, DSINE Normal, IntrinsicAnything Albedo, SuperMat Roughness, затем сохранение проектов при `--save-project`. Выполняются только нужные этапы. Модель остаётся загруженной на протяжении своего прохода и выгружается перед загрузкой следующей. Albedo и Roughness работают в отдельных процессах, каждый из которых обслуживает весь свой проход и завершается до перехода к следующему. Модели подготавливаются один раз на пакет.
+Для нескольких входов генерация выполняется проходами по всему пакету: Depth, CLIPSeg для спрайтов без сохранённой маски, DSINE Normal, AO из итоговой геометрии, IntrinsicAnything Albedo, SuperMat Roughness, затем сохранение проектов при `--save-project`. Выполняются только нужные этапы. Модель остаётся загруженной на протяжении своего прохода и выгружается перед загрузкой следующей. Albedo и Roughness работают в отдельных процессах, каждый из которых обслуживает весь свой проход и завершается до перехода к следующему. Модели подготавливаются один раз на пакет.
 
 Для каждого выбранного типа карт выводится отдельный счётчик, например `Normal: сгенерировано 3 из 10 карт`: сначала 0, затем обновление после каждого успешного экспорта. В JSON это события `progress` с `phase: "batch"`, `map: "depth"|"normal"|"albedo"|"ao"|"roughness"`, `current`, `total` и `unit: "maps"`. `total` — фиксированное число входов после раскрытия каталогов и шаблонов; входы с ошибкой остаются в общем количестве, но не увеличивают число созданных карт. Depth и AO считаются отдельно, вспомогательные этапы и `.ssoul` в эти счётчики не входят. `--progress none` и `--quiet` скрывают счётчики.
 
@@ -169,6 +175,8 @@ Depth PNG сохраняется в 16-битном RGBA: одинаковое �
 | --- | --- | --- |
 | `--maps both\|depth\|normal\|albedo\|ao\|roughness\|all` | Какие карты записывать | `both` |
 | `--depth-map PNG\|DIR` | Готовая Depth для AO/Depth: один PNG или каталог карт для пакета | не задана |
+| `--normal-map PNG\|DIR` | Готовая Normal для AO/Normal: PNG или каталог `<имя>_normal.png`, ориентация `--convention` | не задана |
+| `--ao-depth-only` | Рассчитывать AO из Depth, без AI Normal | выключено |
 | `--normal-source ai` | Источник Normal; поддерживается только DSINE | `ai` |
 | `--convention opengl\|directx` | Конвенция Normal | `opengl` |
 | `--invert-depth` | Инвертировать глубину | выключено |
@@ -183,7 +191,7 @@ Depth PNG сохраняется в 16-битном RGBA: одинаковое �
 | `--crown-mode auto\|off` | Автоматическая коррекция Normal для кроны; `off` не применяет сохранённую маску, но сохраняет её в `.ssoul` | `auto` |
 | `--crown-threshold 0..1` | Порог CLIPSeg при автоматическом поиске кроны | `0.5` |
 | `--ao-radius 1..128` | Радиус AO в пикселях | `24` |
-| `--ao-strength 0..4` | Сила AO | `2` |
+| `--ao-strength 0..4` | Степень итоговой видимости AO; `0` даёт белую карту, геометрия не меняется | `2` |
 | `--albedo-strength 0..4` | Сила коррекции Albedo | `1` |
 | `--albedo-smooth 0..16` | Сглаживание поля освещения Albedo (sigma) | `2` |
 | `--albedo-shadows 0..4` | Сила коррекции теней Albedo | `1` |
@@ -194,6 +202,8 @@ Depth PNG сохраняется в 16-битном RGBA: одинаковое �
 | `--quiet` | Синоним `--progress none` | выключено |
 
 `--maps normal` запускает только DSINE и не загружает Depth Anything V2. `--save-project` требует глубину. `--maps depth` не запускает DSINE. Флаги инверсии, `--ai-smoothing` и `--ai-details` влияют на итоговые нормали так же, как настройки UI. Детализация использует только высокочастотную яркость исходного изображения, сохраняя крупные наклоны DSINE; значение `0` полностью отключает этот этап.
+
+`--normal-map` принимает RGB/RGBA PNG 8 бит. Для нескольких входов нужен каталог с `<имя>_normal.png` для каждого спрайта; размеры проверяются до запуска моделей. `--convention directx` переводит входную Normal в OpenGL для расчёта AO и задаёт ориентацию экспортируемой Normal. Готовая карта используется напрямую, без повторной постобработки, инверсии AI-осей или коррекции кроны; alpha всегда берётся из исходного спрайта. `--maps normal --normal-map ...` также экспортирует готовую карту без DSINE. `--ao-depth-only` несовместим с `--normal-map`. Алгоритм и ограничения AO описаны в [AO](AO.md).
 
 `--maps roughness` подготавливает только SuperMat (около 4,1 ГиБ весов и базовых компонентов) и CUDA. Инференс выполняется в отдельном процессе, в 512×512, за один шаг FP16. Результат — `<имя>_roughness.png` в 8-битном RGBA с исходным размером и alpha. Чёрный = гладкая поверхность, белый = шероховатая. Импортируйте карту как линейные данные без sRGB. Atlas обрабатывается целиком; мелкие детали могут сглаживаться. Roughness экспортируется в PNG и не сохраняется в `.ssoul`.
 

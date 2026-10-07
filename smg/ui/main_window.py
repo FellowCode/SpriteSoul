@@ -147,6 +147,65 @@ class GenerateRoughnessThread(QThread):
             self.failed.emit(str(exc))
 
 
+class AOComputeThread(QThread):
+    calculated = Signal(int, object)
+    failed = Signal(int, str)
+
+    def __init__(self, depth, alpha, normals, radius, strength, revision, parent=None):
+        super().__init__(parent)
+        self.depth, self.alpha = depth.copy(), alpha.copy()
+        self.normals = None if normals is None else normals.copy()
+        self.radius, self.strength, self.revision = radius, strength, revision
+
+    def run(self):
+        try:
+            result = ao_from_depth(self.depth, self.alpha, self.radius, self.strength,
+                                   normals=self.normals)
+            self.calculated.emit(self.revision, result)
+        except Exception as exc:
+            self.failed.emit(self.revision, str(exc))
+
+
+class GenerateAOThread(QThread):
+    """Generate only missing geometry; reuse maps already present in the UI."""
+    depth_generated = Signal(object)
+    normal_generated = Signal(object)
+    completed = Signal()
+    failed = Signal(str)
+    progress = Signal(str)
+    progress_event = Signal(object)
+
+    def __init__(self, rgba, needs_depth, needs_normal, fov, foliage_mask, parent=None):
+        super().__init__(parent)
+        self.rgba = rgba.copy()
+        self.needs_depth = needs_depth
+        self.needs_normal = needs_normal
+        self.fov = fov
+        self.foliage_mask = None if foliage_mask is None else foliage_mask.copy()
+
+    def run(self):
+        try:
+            models = []
+            if self.needs_depth:
+                models.append("depth")
+            if self.needs_normal:
+                models.append("ai")
+                if self.foliage_mask is None:
+                    models.append("clipseg")
+            prepare_environment(models, self.progress.emit, events=self.progress_event.emit)
+            if self.needs_depth:
+                self.depth_generated.emit(generate_depth(self.rgba, DepthModel(), self.progress.emit))
+            if self.needs_normal:
+                crown = self.foliage_mask
+                if crown is None:
+                    crown = detect_tree_crown(self.rgba, self.progress.emit)
+                vectors = DSINENormalModel(self.fov).generate(self.rgba, self.progress.emit)
+                self.normal_generated.emit((vectors, crown))
+            self.completed.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class GenerateAllThread(QThread):
     depth_generated = Signal(object)
     normal_generated = Signal(object)
@@ -208,6 +267,9 @@ class MainWindow(QMainWindow):
         self.base_depth: np.ndarray | None = None
         self.depth: np.ndarray | None = None
         self._preview_ao: np.ndarray | None = None
+        self._ao_revision = 0
+        self._ao_failed_revision: int | None = None
+        self._ao_worker: AOComputeThread | None = None
         self._show_ao_after_generation = False
         self._preview_normal: np.ndarray | None = None
         self.ai_vectors: np.ndarray | None = None  # OpenGL float XYZ, converted at inference time
@@ -341,7 +403,7 @@ class MainWindow(QMainWindow):
         form.addRow("Контраст", self._slider_field(self.contrast, lambda v: f"{v / 100:.2f}×"))
         form.addRow("Сглаживание", self._slider_field(self.smooth, lambda v: f"{v / 10:.1f}"))
 
-        self.ao_section = ControlSection("Затенение · AO", "Затемнение углублений на основе Depth.")
+        self.ao_section = ControlSection("Затенение · AO", "Затемнение углублений по Depth и Normal.")
         groups_layout.addWidget(self.ao_section)
         ao_form = self._control_form(self.ao_section.content_layout)
         self.ao_radius = QSpinBox()
@@ -746,7 +808,7 @@ class MainWindow(QMainWindow):
             self.source = source
             self.base_depth = depth
             self.depth = process_depth(depth, source[..., 3], DepthSettings()) if depth is not None else None
-            self._preview_ao = None
+            self._invalidate_ao()
             self._preview_normal = None
             self.ai_vectors = None
             self.albedo = None
@@ -831,6 +893,7 @@ class MainWindow(QMainWindow):
             return
         self.foliage_mask = self._selection_mask.copy()
         self._preview_normal = None
+        self._invalidate_ao()
         self._stop_foliage_selection()
         if self.ai_vectors is not None:
             self.mode.setCurrentText("Normal")
@@ -873,11 +936,33 @@ class MainWindow(QMainWindow):
     def generate_ao(self) -> None:
         if self.source is None or (self.worker is not None and self.worker.isRunning()):
             return
-        if self.depth is not None:
-            self.mode.setCurrentText("AO")
-            self._refresh()
+        needs_depth, needs_normal = self.depth is None, self.ai_vectors is None
+        if not needs_depth and not needs_normal:
+            self._ao_generated()
             return
-        self._start_depth_generation(True)
+        models = (("depth",) if needs_depth else ()) + (("ai",) if needs_normal else ())
+        if needs_normal and self.foliage_mask is None:
+            models += ("clipseg",)
+        if not self._confirm_model_download(models):
+            return
+        self.worker = GenerateAOThread(
+            self.source, needs_depth, needs_normal, self.ai_fov.value(), self.foliage_mask, self,
+        )
+        self._connect_worker_progress(self.worker)
+        self.worker.depth_generated.connect(self._generated)
+        self.worker.normal_generated.connect(self._ai_generated)
+        self.worker.completed.connect(self._ao_generated)
+        self.worker.failed.connect(self._generation_failed)
+        self.worker.finished.connect(self._generation_finished)
+        self.worker.start()
+        self._update_actions()
+
+    def _ao_generated(self) -> None:
+        self._invalidate_ao()
+        self.mode.setCurrentText("AO")
+        self._refresh()
+        if self._preview_ao is not None:
+            self.statusBar().showMessage("AO из Depth и Normal готова")
 
     def prepare_ai(self) -> None:
         if self.worker is not None and self.worker.isRunning():
@@ -999,6 +1084,7 @@ class MainWindow(QMainWindow):
             self.foliage_mask = crown.copy()
         self.ai_vectors = vectors
         self._preview_normal = None
+        self._invalidate_ao()
         self.mode.setCurrentText("Normal")
         self._refresh()
         self.statusBar().showMessage("AI Normal готова")
@@ -1006,7 +1092,7 @@ class MainWindow(QMainWindow):
     def _generated(self, depth: np.ndarray) -> None:
         self.base_depth = np.asarray(depth, np.float32)
         self.depth = process_depth(self.base_depth, self.source[..., 3], DepthSettings())
-        self._preview_ao = None
+        self._invalidate_ao()
         self._preview_normal = None
         self.mode.setCurrentText("AO" if self._show_ao_after_generation else "Depth")
         self._show_ao_after_generation = False
@@ -1080,18 +1166,19 @@ class MainWindow(QMainWindow):
         settings = DepthSettings(self.invert.isChecked(), self.depth_strength.value() / 100,
                                  self.contrast.value() / 100, self.smooth.value() / 10)
         self.depth = process_depth(self.base_depth, self.source[..., 3], settings)
-        self._preview_ao = None
+        self._invalidate_ao()
         self._preview_normal = None
         self._refresh()
 
     def _normal_changed(self) -> None:
         if not self._building:
             self._preview_normal = None
+            self._invalidate_ao()
             self._refresh()
 
     def _ao_changed(self) -> None:
         if not self._building:
-            self._preview_ao = None
+            self._invalidate_ao()
             if self.mode.currentText() in ("AO", "Lighting Preview"):
                 self._refresh()
 
@@ -1100,18 +1187,67 @@ class MainWindow(QMainWindow):
             self._preview_ao = ao_from_depth(
                 self.depth, self.source[..., 3],
                 self.ao_radius.value(), self.ao_strength.value(),
+                normals=self._selected_normal_vectors() if self.ai_vectors is not None else None,
             )
         return self._preview_ao
+
+    def _invalidate_ao(self) -> None:
+        self._ao_revision += 1
+        self._ao_failed_revision = None
+        self._preview_ao = None
+
+    def _display_ao(self) -> np.ndarray:
+        # Small sprites are cheap. Large maps run off the GUI thread; export
+        # still asks _selected_ao for a complete map with the current settings.
+        if self._preview_ao is not None:
+            return self._preview_ao
+        if self.depth.size <= 65536 or self.ao_strength.value() == 0:
+            return self._selected_ao()
+        if self._ao_failed_revision == self._ao_revision:
+            return np.ones_like(self.depth)
+        if self._ao_worker is None:
+            normals = self._selected_normal_vectors() if self.ai_vectors is not None else None
+            self._ao_worker = AOComputeThread(
+                self.depth, self.source[..., 3], normals, self.ao_radius.value(),
+                self.ao_strength.value(), self._ao_revision, self,
+            )
+            self._ao_worker.calculated.connect(self._ao_calculated)
+            self._ao_worker.failed.connect(self._ao_calculation_failed)
+            self._ao_worker.finished.connect(self._ao_calculation_finished)
+            self._ao_worker.start()
+            self.statusBar().showMessage("Расчёт AO…")
+        return np.ones_like(self.depth)
+
+    def _ao_calculated(self, revision: int, ao: np.ndarray) -> None:
+        if revision == self._ao_revision:
+            self._preview_ao = ao
+            self._refresh()
+            self.statusBar().showMessage("AO готова")
+
+    def _ao_calculation_failed(self, revision: int, message: str) -> None:
+        if revision == self._ao_revision:
+            self._ao_failed_revision = revision
+            self.statusBar().showMessage("Ошибка AO: " + message)
+
+    def _ao_calculation_finished(self) -> None:
+        self._ao_worker.deleteLater()
+        self._ao_worker = None
+        if self.mode.currentText() in ("AO", "Lighting Preview"):
+            self._refresh()
 
     def _fov_changed(self) -> None:
         if self._building:
             return
         self.ai_vectors = None
         self._preview_normal = None
+        self._invalidate_ao()
         if self.source is not None:
             self.generate_ai_normal()
 
     def _selected_normal(self, convention: str) -> np.ndarray:
+        return ai_normal(self._selected_normal_vectors(), self.source[..., 3], convention)
+
+    def _selected_normal_vectors(self) -> np.ndarray:
         alpha = self.source[..., 3]
         if self.ai_vectors is None:
             raise RuntimeError("Сначала сгенерируйте AI Normal")
@@ -1126,7 +1262,7 @@ class MainWindow(QMainWindow):
             ai_vectors = compose_crown_normals(
                 ai_vectors, self.foliage_mask, alpha,
             )
-        return ai_normal(ai_vectors, alpha, convention)
+        return ai_vectors
 
     def _mode_changed(self, mode: str) -> None:
         self.view.mode = mode
@@ -1159,7 +1295,7 @@ class MainWindow(QMainWindow):
                 self.view.set_pixels(pixels, fit)
                 self._update_actions()
                 return
-            grey = np.rint((self.depth if mode == "Depth" else self._selected_ao()) * 255).astype(np.uint8)
+            grey = np.rint((self.depth if mode == "Depth" else self._display_ao()) * 255).astype(np.uint8)
             pixels = np.empty_like(self.source)
             pixels[..., :3] = grey[..., None]
             pixels[..., 3] = self.source[..., 3]
@@ -1172,7 +1308,7 @@ class MainWindow(QMainWindow):
                 if self._preview_normal is None:
                     self._preview_normal = self._selected_normal("OpenGL")
                 lighting_base = self.albedo if self.albedo is not None else self.source
-                ao = self._selected_ao() if self.depth is not None else None
+                ao = self._display_ao() if self.depth is not None else None
                 pixels = render_lighting(
                     lighting_base, self._preview_normal, *self.light,
                     ao=ao, roughness=self.roughness,
@@ -1251,7 +1387,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Ошибка экспорта", str(exc))
 
     def closeEvent(self, event) -> None:
-        if self.worker is not None and self.worker.isRunning():
+        if ((self.worker is not None and self.worker.isRunning())
+                or (self._ao_worker is not None and self._ao_worker.isRunning())):
             event.ignore()
             self.statusBar().showMessage("Дождитесь завершения генерации перед закрытием")
             return
