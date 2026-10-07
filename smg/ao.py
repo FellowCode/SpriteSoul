@@ -10,6 +10,18 @@ import numpy as np
 from smg.normal import normalize_vectors
 
 
+GPU_MIN_PIXELS = 4096
+
+
+def _cuda_runtime():
+    """Optional, lazy PyTorch import: CPU-only installations keep working."""
+    try:
+        import torch
+    except (ImportError, OSError):
+        return None
+    return torch if torch.cuda.is_available() else None
+
+
 def _edges(labels):
     return ((labels[:, 1:] == labels[:, :-1]) & (labels[:, 1:] != 0),
             (labels[1:] == labels[:-1]) & (labels[1:] != 0))
@@ -86,7 +98,7 @@ def _integral(angle, horizontal, vertical):
 
 def ao_from_depth(depth: np.ndarray, alpha: np.ndarray, radius: int = 24,
                   strength: float = 2.0, *, normals: np.ndarray | None = None,
-                  height_scale: float | None = None) -> np.ndarray:
+                  height_scale: float | None = None, device: str = "auto") -> np.ndarray:
     """Return float32 visibility in [0, 1]; transparent pixels stay white.
 
     Optional OpenGL normals refine relief and orient the occlusion hemisphere.
@@ -94,9 +106,13 @@ def ao_from_depth(depth: np.ndarray, alpha: np.ndarray, radius: int = 24,
     normalized depth to pixel units; by default each sprite uses 1/4 of its
     bounding-box span, making relief independent of atlas padding. Strength is
     a final visibility exponent; it does not change geometry or sampling.
+    ``device`` is ``auto``, ``cpu`` or ``cuda``. Auto uses CUDA for maps of
+    at least 4096 pixels when available, and falls back to CPU on GPU OOM.
     """
     height = np.asarray(depth, np.float32)
     opacity = np.asarray(alpha)
+    if device not in ("auto", "cpu", "cuda"):
+        raise ValueError("Устройство AO должно быть auto, cpu или cuda")
     if height.ndim != 2 or opacity.shape != height.shape or not height.size:
         raise ValueError("Depth и alpha должны иметь одинаковый двухмерный размер")
     if (not isinstance(radius, (int, np.integer)) or radius < 1
@@ -124,6 +140,21 @@ def ao_from_depth(depth: np.ndarray, alpha: np.ndarray, radius: int = 24,
     height = np.where(visible, height, 0) * (scale[labels] if height_scale is None else height_scale)
     height = height.astype(np.float32)
     coverage = opacity.astype(np.float32) / 255
+    if device == "cuda" or (device == "auto" and height.size >= GPU_MIN_PIXELS):
+        torch = _cuda_runtime()
+        if torch is None and device == "cuda":
+            raise RuntimeError("Для AO на GPU необходимы CUDA-сборка PyTorch и доступная NVIDIA GPU")
+        if torch is not None:
+            from smg.ao_gpu import ao_cuda
+
+            try:
+                return ao_cuda(height, normals, labels, coverage, radius, strength)
+            except torch.cuda.OutOfMemoryError as exc:
+                if device == "cuda":
+                    raise
+                # Release failed GPU-frame temporaries before the CPU fallback.
+                exc.__traceback__ = None
+                torch.cuda.empty_cache()
     if normals is not None:
         height = _guided_relief(height, normals, labels, coverage, radius)
     gx, gy = _gradient(height, labels)

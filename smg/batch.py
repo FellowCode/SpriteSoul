@@ -155,7 +155,7 @@ def run_batch(args, reporter) -> int:
         vectors = None if args.ao_depth_only else state.get("normal_vectors")
         progress("Расчёт AO из Depth и Normal..." if vectors is not None else "Расчёт AO из Depth...")
         write(job, "ao", ao_from_depth(state["depth"], alpha, args.ao_radius, args.ao_strength,
-                                       normals=vectors), alpha)
+                                       normals=vectors, device=args.ao_device), alpha)
         state.pop("normal_vectors", None)
         if not args.save_project:
             state.pop("depth", None)

@@ -176,6 +176,35 @@ def test_cli_rejects_wrong_normal_size_before_loading_models(tmp_path, monkeypat
     assert "Normal 5x4" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_cli_routes_ao_device_in_single_and_batch_exports(tmp_path, monkeypatch, batch, device):
+    from smg import ao, setup
+
+    monkeypatch.setattr(setup, "prepare_environment", lambda *a, **kw:
+                        (_ for _ in ()).throw(AssertionError("Imported maps must skip model setup")))
+    captured = []
+
+    def calculate(depth, alpha, *args, **kwargs):
+        captured.append(kwargs["device"])
+        assert kwargs["normals"] is not None
+        return np.full(depth.shape, 0.7, np.float32)
+
+    monkeypatch.setattr(ao, "ao_from_depth", calculate)
+    directory = tmp_path / "maps"
+    directory.mkdir()
+    sources = []
+    for name in (["one", "two"] if batch else ["one"]):
+        source = tmp_path / f"{name}.png"
+        rgba = _source(source)
+        sources.append(source)
+        assert cv2.imwrite(str(directory / f"{name}_depth.png"), np.full(rgba.shape[:2], 128, np.uint8))
+        Image.fromarray(np.full(rgba.shape, (128, 128, 255, 255), np.uint8)).save(directory / f"{name}_normal.png")
+    assert main([*map(str, sources), "--maps", "ao", "--depth-map", str(directory),
+                 "--normal-map", str(directory), "--ao-device", device, "-o", str(tmp_path / "out")]) == 0
+    assert captured == [device] * len(sources)
+
+
 def test_cli_project_depth_can_be_overridden_by_png(tmp_path, monkeypatch):
     from smg import setup
 

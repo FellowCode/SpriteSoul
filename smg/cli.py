@@ -77,6 +77,8 @@ def _add_generate_args(parser: argparse.ArgumentParser) -> None:
                         help="готовая Normal для AO/Normal: PNG или каталог с <имя>_normal.png; ориентация --convention")
     parser.add_argument("--ao-depth-only", action="store_true",
                         help="рассчитать AO только из Depth, без генерации DSINE Normal")
+    parser.add_argument("--ao-device", choices=("auto", "cpu", "cuda"), default="auto",
+                        help="устройство расчёта AO: auto выбирает CUDA при наличии GPU (по умолчанию: auto)")
     parser.add_argument("--normal-source", choices=("ai",), default="ai",
                         help="источник нормалей: только AI/DSINE")
     parser.add_argument("--convention", choices=("opengl", "directx"), default="opengl",
@@ -132,7 +134,7 @@ def build_parser() -> argparse.ArgumentParser:
                 "  sprite-soul generate sprites/ --maps all -o exported\n\n"
                 "Подробности: sprite-soul generate --help; sprite-soul setup --help."),
     )
-    parser.add_argument("--version", action="version", version="sprite-soul 0.1.2")
+    parser.add_argument("--version", action="version", version="sprite-soul 0.1.3")
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")
     generate = commands.add_parser(
         "generate", help="создать карты из PNG или проекта .ssoul",
@@ -318,7 +320,7 @@ def _run_one(path: Path, args: argparse.Namespace, reserved: set[Path],
     if wants_ao:
         progress("Расчёт AO из Depth и Normal..." if vectors is not None else "Расчёт AO из Depth...")
         ao = ao_from_depth(depth, rgba[..., 3], args.ao_radius, args.ao_strength,
-                           normals=None if args.ao_depth_only else vectors)
+                           normals=None if args.ao_depth_only else vectors, device=args.ao_device)
         export_ao(source_path, ao, rgba[..., 3], output)
     if wants_normal:
         export_normal(source_path, normal, output)

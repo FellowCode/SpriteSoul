@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
 )
 
 from smg.depth.inference import DepthModel
-from smg.ao import ao_from_depth
+from smg.ao import GPU_MIN_PIXELS, ao_from_depth
 from smg.albedo_ai import generate_albedo
 from smg.roughness_ai import generate_roughness
 from smg.crown_normal import compose_crown_normals
@@ -1201,7 +1201,7 @@ class MainWindow(QMainWindow):
         # still asks _selected_ao for a complete map with the current settings.
         if self._preview_ao is not None:
             return self._preview_ao
-        if self.depth.size <= 65536 or self.ao_strength.value() == 0:
+        if self.depth.size < GPU_MIN_PIXELS or self.ao_strength.value() == 0:
             return self._selected_ao()
         if self._ao_failed_revision == self._ao_revision:
             return np.ones_like(self.depth)

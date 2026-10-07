@@ -75,6 +75,9 @@ py -3.11 -m venv .venv
 # AO из двух готовых карт, без запуска моделей
 .\.venv\Scripts\sprite-soul.exe generate .\assets\tree.png --maps ao --depth-map .\maps\tree_depth.png --normal-map .\maps\tree_normal.png
 
+# Принудительный расчёт AO на CUDA GPU (auto выбирает устройство автоматически)
+.\.venv\Scripts\sprite-soul.exe generate .\assets\tree.png --maps ao --depth-map .\maps\tree_depth.png --normal-map .\maps\tree_normal.png --ao-device cuda
+
 # AO только из Depth, без DSINE
 .\.venv\Scripts\sprite-soul.exe generate .\assets\tree.png --maps ao --depth-map .\maps\tree_depth.png --ao-depth-only
 
@@ -177,6 +180,7 @@ Depth PNG сохраняется в 16-битном RGBA: одинаковое �
 | `--depth-map PNG\|DIR` | Готовая Depth для AO/Depth: один PNG или каталог карт для пакета | не задана |
 | `--normal-map PNG\|DIR` | Готовая Normal для AO/Normal: PNG или каталог `<имя>_normal.png`, ориентация `--convention` | не задана |
 | `--ao-depth-only` | Рассчитывать AO из Depth, без AI Normal | выключено |
+| `--ao-device auto\|cpu\|cuda` | Устройство AO; `auto` использует CUDA для карт от 4096 пикселей и возвращается на CPU при отсутствии CUDA или GPU OOM | `auto` |
 | `--normal-source ai` | Источник Normal; поддерживается только DSINE | `ai` |
 | `--convention opengl\|directx` | Конвенция Normal | `opengl` |
 | `--invert-depth` | Инвертировать глубину | выключено |
@@ -204,6 +208,8 @@ Depth PNG сохраняется в 16-битном RGBA: одинаковое �
 `--maps normal` запускает только DSINE и не загружает Depth Anything V2. `--save-project` требует глубину. `--maps depth` не запускает DSINE. Флаги инверсии, `--ai-smoothing` и `--ai-details` влияют на итоговые нормали так же, как настройки UI. Детализация использует только высокочастотную яркость исходного изображения, сохраняя крупные наклоны DSINE; значение `0` полностью отключает этот этап.
 
 `--normal-map` принимает RGB/RGBA PNG 8 бит. Для нескольких входов нужен каталог с `<имя>_normal.png` для каждого спрайта; размеры проверяются до запуска моделей. `--convention directx` переводит входную Normal в OpenGL для расчёта AO и задаёт ориентацию экспортируемой Normal. Готовая карта используется напрямую, без повторной постобработки, инверсии AI-осей или коррекции кроны; alpha всегда берётся из исходного спрайта. `--maps normal --normal-map ...` также экспортирует готовую карту без DSINE. `--ao-depth-only` несовместим с `--normal-map`. Алгоритм и ограничения AO описаны в [AO](AO.md).
+
+`--ao-device cuda` требует установленный PyTorch с CUDA и доступную NVIDIA GPU; если CUDA недоступна или видеопамяти недостаточно, явный режим сообщает об ошибке. `auto` не устанавливает PyTorch ради расчёта готовых карт: без CUDA AO работает на CPU. `cpu` отключает GPU только для AO; генерация недостающих AI-карт по-прежнему требует CUDA. Этот параметр применяется также при `--ao-depth-only`, `--maps all` и пакетной обработке. CUDA-реализация сохраняет исходный размер и плотность выборок, использует float32 и передаёт результат в обычный PNG-экспорт.
 
 `--maps roughness` подготавливает только SuperMat (около 4,1 ГиБ весов и базовых компонентов) и CUDA. Инференс выполняется в отдельном процессе, в 512×512, за один шаг FP16. Результат — `<имя>_roughness.png` в 8-битном RGBA с исходным размером и alpha. Чёрный = гладкая поверхность, белый = шероховатая. Импортируйте карту как линейные данные без sRGB. Atlas обрабатывается целиком; мелкие детали могут сглаживаться. Roughness экспортируется в PNG и не сохраняется в `.ssoul`.
 

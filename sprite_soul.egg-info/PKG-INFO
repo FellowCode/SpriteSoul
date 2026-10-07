@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: sprite-soul
-Version: 0.1.2
+Version: 0.1.3
 Summary: Local depth and normal map editor for PNG sprites
 Requires-Python: <3.14,>=3.11
 Requires-Dist: numpy<3,>=1.26
